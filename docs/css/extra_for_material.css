@@ -1,0 +1,99 @@
+/******************** Left side bar ***************************/
+nav.md-nav--primary {
+	border-right-style: solid;
+	border-right-width: 2px;
+	border-right-color: #d6d6d6;
+}
+
+
+/******************* Right Side Bar ***************************/
+nav.md-nav--secondary {
+	border-left-style: solid;
+	border-left-width: 2px;
+	border-left-color: #d6d6d6;
+}
+
+/******************* Callout ***************************/
+.admonition-title {
+	font-size: 16px;
+}
+
+.admonition-abstract {
+	font-size: 16px;
+}
+
+.admonition.info {
+	font-size: 16px;
+}
+
+.admonition.note {
+	font-size: 16px;
+}
+
+.admonition.quote {
+	font-size: 16px;
+}
+
+.admonition.warning {
+	font-size: 16px;
+}
+
+
+/******************* Code ***************************/
+code {
+	border-width: 1px;
+}
+
+code.highlight{
+	border-top-style: solid;
+	border-top-width: 5px;
+	border-top-color: #587feb;
+}
+
+code.language-python {
+	margin-top: 0px;
+	padding-left: 10px;
+	display: block;
+	font-weight: bold;
+}
+
+
+/******************* Class Region ***************************/
+div.doc-class {
+	margin-bottom: 100px;
+	padding-right: 3px;
+	border-top-width: 5px;
+	border-top-style: solid;
+	border-top-color: #0eb0c9;
+}
+
+
+/******************* Function Region ***************************/
+div.md-typeset__table {
+	padding-right: 16px;
+	margin-bottom: 0px;
+	font-weight: bold;
+}
+
+div.doc-function {
+	align-self: flex-start;
+	border-right-width: 1px;
+	border-right-style : solid;
+	border-right-color: #d6d6d6;
+	padding-bottom: 0px;
+	margin-bottom: 18px;
+}
+
+
+
+/******************* Details ***************************/
+summary {
+	text-align: left;
+	font-weight: bold;
+}
+
+
+em {
+	text-align: center;
+	font-style: italic;
+}

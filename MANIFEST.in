@@ -1,0 +1,2 @@
+include tactics2d/participant/trajectory_classifier.m
+include tactics2d/dataset_parser/map.config
