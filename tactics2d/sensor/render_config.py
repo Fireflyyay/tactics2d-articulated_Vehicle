@@ -66,6 +66,10 @@ DEFAULT_COLOR = {
     "building": COLOR_PALETTE["gray"],
     "traffic_island": COLOR_PALETTE["dark-gray"],
     "obstacle": COLOR_PALETTE["gray"],
+    "start_area": "#6495ed",
+    "start_rear_area": "#6495ed",
+    "target_area": "#458b00",
+    "target_rear_area": "#458b00",
     # default color for roadline class subtypes
     "roadline": COLOR_PALETTE["white"],
     "curbstone": COLOR_PALETTE["light-gray"],
@@ -116,6 +120,10 @@ DEFAULT_ORDER = {
     "building": 5,
     "traffic_island": 3,
     "obstacle": 5,
+    "start_area": 4,
+    "start_rear_area": 4,
+    "target_area": 4,
+    "target_rear_area": 4,
     # default zorder for roadline class subtypes
     "roadline": 4,
     "road_border": 4,

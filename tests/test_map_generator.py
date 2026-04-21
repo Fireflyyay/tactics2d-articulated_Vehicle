@@ -19,9 +19,10 @@ from shapely.geometry import Point
 logging.basicConfig(level=logging.INFO)
 
 from tactics2d.map.element import Area, Map
-from tactics2d.map.generator import ParkingLotGenerator, RacingTrackGenerator
-from tactics2d.participant.trajectory import State
+from tactics2d.map.generator import PPOParkingMapGenerator, ParkingLotGenerator, RacingTrackGenerator
+from tactics2d.participant.trajectory import ArticulatedState, State
 from tactics2d.sensor import BEVCamera, MatplotlibRenderer
+from tactics2d.utils.ppo_articulated_defaults import PPO_NAVIGATION_BOUNDARY
 
 
 @pytest.mark.map_generator
@@ -50,6 +51,7 @@ def test_parking_lot_generator():
 
 
 @pytest.mark.map_generator
+@pytest.mark.skipif(RacingTrackGenerator is None, reason="cpp_geometry extension is unavailable")
 def test_racing_track_generator():
     map_generator = RacingTrackGenerator()
     map_ = Map(name="racing_track", scenario_type="racing")
@@ -69,6 +71,26 @@ def test_racing_track_generator():
     matplotlib_renderer.save_single_frame(save_to="./tests/runtime/racing_track.png")
 
     assert isinstance(map_.customs["start_state"], State), "start_state should be a State object."
+
+
+@pytest.mark.map_generator
+def test_ppo_parking_map_generator_navigation_scene():
+    map_generator = PPOParkingMapGenerator(scene_type="navigation", map_level="Normal")
+    map_ = Map(name="ppo_navigation", scenario_type="navigation")
+    start_state, target_area, target_heading = map_generator.generate(map_, seed=42)
+
+    obstacle_areas = [area for area in map_.areas.values() if area.subtype == "obstacle"]
+    freespace_areas = [area for area in map_.areas.values() if area.subtype == "freespace"]
+
+    assert isinstance(start_state, ArticulatedState), "start_state should be an ArticulatedState object."
+    assert isinstance(target_area, Area), "target_area should be an Area object."
+    assert target_heading == pytest.approx(map_.customs["dest_state"].heading)
+    assert map_.boundary == PPO_NAVIGATION_BOUNDARY
+    assert map_.customs["source"] == "ppo_articulated_vehicle"
+    assert map_.customs["scene_meta"] is not None
+    assert len(obstacle_areas) == map_generator.num_obstacles
+    assert len(obstacle_areas) > 0
+    assert len(freespace_areas) > 0
 
 
 # if __name__ == "__main__":

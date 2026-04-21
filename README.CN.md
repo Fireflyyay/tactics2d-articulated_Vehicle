@@ -117,6 +117,60 @@ pip install -v .
 git submodule update --init --recursive
 ```
 
+#### 3.1 Wheel Loader 场景的 PPO primitive 规划可视化
+
+当前仓库已经支持在`tactics2d`内部直接加载 PPO_articulated_vehicle 的策略权重和 primitive 库，用于 wheel loader 导航场景的在线重规划。第一阶段实现方式是：PPO 策略输出 primitive，随后在`tactics2d`中将 primitive rollout 转成短时参考轨迹，再交给现有跟踪器进行跟踪与可视化。
+
+运行前请确认以下目录关系存在：
+
+- 仓库根目录下存在`PPO_articulated_vehicle`
+- 仓库根目录下存在`BestCheckPoint`
+- `BestCheckPoint`目录中包含`PPO_best.pt`
+- `BestCheckPoint/adaptive_primitives/active_version.json`指向可用的 primitive 库版本
+
+推荐在仓库根目录内使用已有环境直接运行：
+
+```bash
+cd tactics2d-articulated_Vehicle
+PYGAME_HIDE_SUPPORT_PROMPT=1 conda run -n ppomp python examples/pygame_scene_player.py \
+  --scene wheel_loader \
+  --backend ppo \
+  --wheel-loader-planner ppo \
+  --ppo-checkpoint /Users/firefly/Desktop/Research/Codes/BestCheckPoint/PPO_best.pt
+```
+
+如果你已经激活了`ppomp`环境，也可以直接运行：
+
+```bash
+cd tactics2d-articulated_Vehicle
+PYGAME_HIDE_SUPPORT_PROMPT=1 python examples/pygame_scene_player.py \
+  --scene wheel_loader \
+  --backend ppo \
+  --wheel-loader-planner ppo \
+  --ppo-checkpoint /Users/firefly/Desktop/Research/Codes/BestCheckPoint/PPO_best.pt
+```
+
+常用参数说明：
+
+- `--wheel-loader-planner ppo`：启用 PPO primitive 规划模式；如果不传，默认仍使用原有跟踪链路
+- `--ppo-checkpoint`：指定 PPO 权重文件路径
+- `--backend ppo`：使用 PPO 风格的导航场景生成器
+- `--ppo-root`：当`PPO_articulated_vehicle`不在默认相对位置时，可手动指定 PPO 仓库根目录
+- `--ppo-replan-every`：设置每隔多少个仿真步重规划一次，默认值为`1`
+- `--ppo-stochastic`：默认是 deterministic 推理；传入该参数后使用随机采样动作
+
+说明：
+
+- 示例脚本现在会优先导入当前仓库内的本地`tactics2d`源码，因此建议从仓库目录运行，而不是在其他目录中调用脚本
+- 当前 PPO 接入主要面向`wheel_loader + navigation + backend=ppo`组合
+- 如果 PPO 规划失败，运行时会回退到现有的 guidance/reference 轨迹，不会阻塞示例启动
+
+如果你只想做无窗口快速验证，可以运行对应测试：
+
+```bash
+conda run -n ppomp python -m pytest tests/test_pygame_runtime_ppo_bridge.py -q
+```
+
 ### 4. 更多示例
 
 我们为`tactics2d`搭建了一套完整的集成测试流程，其中的测试代码可以作为函数接口用法的参考。你可以在[这里](tests)找到这些测试代码。运行测试代码的方法如下：

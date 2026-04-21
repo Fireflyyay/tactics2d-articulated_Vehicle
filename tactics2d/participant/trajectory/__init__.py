@@ -5,7 +5,8 @@
 # @Author: Yueyuan Li
 # @Version: 1.0.0
 
+from .articulated_state import ArticulatedState
 from .state import State
 from .trajectory import Trajectory
 
-__all__ = ["State", "Trajectory"]
+__all__ = ["State", "ArticulatedState", "Trajectory"]

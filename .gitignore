@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+
+# Python cache and tooling
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging
+build/
+dist/
+pip-wheel-metadata/
+*.egg-info/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Editor settings
+.vscode/
+.idea/
+
+# Runtime outputs and local debug artifacts
+examples/runtime/
+tests/runtime/
+wheel_loader_log.csv
+wheel_loader_trajectory.png

@@ -7,6 +7,12 @@
 
 
 from .generate_parking_lot import ParkingLotGenerator
-from .generate_racing_track import RacingTrackGenerator
+from .generate_ppo_parking_map import PPOParkingMapGenerator
+try:
+	from .generate_racing_track import RacingTrackGenerator
+except ModuleNotFoundError:
+	RacingTrackGenerator = None
 
-__all__ = ["RacingTrackGenerator", "ParkingLotGenerator"]
+__all__ = ["ParkingLotGenerator", "PPOParkingMapGenerator"]
+if RacingTrackGenerator is not None:
+	__all__.append("RacingTrackGenerator")
