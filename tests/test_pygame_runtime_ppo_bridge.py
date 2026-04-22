@@ -2,11 +2,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import tactics2d.renderer.ppo_primitive_bridge as ppo_bridge_module
 
 from tactics2d.map.element import Map
 from tactics2d.map.generator.generate_wheel_loader_scenario import WheelLoaderScenarioGenerator
 from tactics2d.renderer import SimulationRunner, adapt_generated_scene, create_default_participant
 from tactics2d.renderer.ppo_primitive_bridge import PPOPrimitivePathPlanner
+from tactics2d.renderer.wheel_loader_stress import run_wheel_loader_stress_suite
 
 
 def _workspace_root() -> Path:
@@ -64,6 +66,7 @@ def test_ppo_primitive_planner_builds_reference():
     assert result.metadata["planning_mode"] == "closed_loop_policy"
     assert result.metadata["action_mask_used"] is True
     assert result.metadata["action_mask_feasible_count"] > 0
+    assert result.metadata["plan_runtime_ms"] >= 0.0
     assert len(result.metadata["primitive_sequence"]) == 1
     assert result.metadata["control_actions_shape"] == result.control_actions.shape
     assert result.metadata["primitive_selected_count"] == 1
@@ -85,6 +88,44 @@ def test_ppo_primitive_planner_builds_reference():
     if second_result.metadata["primitive_origin"] == "adaptive":
         assert second_result.metadata["primitive_added_round"] is not None
         assert second_result.metadata["adaptive_round_selection_counts"][second_result.metadata["primitive_added_round"]] >= 1
+
+
+@pytest.mark.render
+def test_ppo_primitive_planner_reuses_runtime_assets(monkeypatch):
+    checkpoint_path, ppo_root = _ppo_assets()
+    load_calls = 0
+    original_load_checkpoint = ppo_bridge_module._load_checkpoint
+
+    def _counted_load_checkpoint(*args, **kwargs):
+        nonlocal load_calls
+        load_calls += 1
+        return original_load_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(ppo_bridge_module, "_load_checkpoint", _counted_load_checkpoint)
+    PPOPrimitivePathPlanner.clear_runtime_asset_cache()
+    try:
+        planner1 = PPOPrimitivePathPlanner(
+            checkpoint_path=str(checkpoint_path),
+            ppo_root=str(ppo_root),
+            control_interval_ms=100,
+            replan_every_steps=1,
+            deterministic=True,
+        )
+        planner2 = PPOPrimitivePathPlanner(
+            checkpoint_path=str(checkpoint_path),
+            ppo_root=str(ppo_root),
+            control_interval_ms=100,
+            replan_every_steps=1,
+            deterministic=True,
+        )
+    finally:
+        PPOPrimitivePathPlanner.clear_runtime_asset_cache()
+
+    assert load_calls == 1
+    assert planner1.runtime_asset_cache_hit is False
+    assert planner2.runtime_asset_cache_hit is True
+    assert planner1.primitive_library is planner2.primitive_library
+    assert planner1.agent is not planner2.agent
 
 
 @pytest.mark.render
@@ -133,6 +174,8 @@ def test_simulation_runner_consumes_ppo_reference():
     assert isinstance(initial_primitive_id, int)
     assert runner.pending_primitive_controls
     assert runner.pending_primitive_control_index == 1
+    assert len(runner.planning_history) >= 1
+    assert runner.planning_history[0]["runtime_ms"] >= 0.0
 
     runner.step_once()
 
@@ -142,6 +185,87 @@ def test_simulation_runner_consumes_ppo_reference():
         runner.last_planning_result.metadata["primitive_selection_counts"][runner.last_planning_result.primitive_id]
         == runner.last_planning_result.metadata["primitive_selected_count"]
     )
+
+
+@pytest.mark.render
+def test_simulation_runner_reuses_planner_runtime_assets(monkeypatch):
+    checkpoint_path, ppo_root = _ppo_assets()
+    load_calls = 0
+    original_load_checkpoint = ppo_bridge_module._load_checkpoint
+
+    def _counted_load_checkpoint(*args, **kwargs):
+        nonlocal load_calls
+        load_calls += 1
+        return original_load_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(ppo_bridge_module, "_load_checkpoint", _counted_load_checkpoint)
+    PPOPrimitivePathPlanner.clear_runtime_asset_cache()
+    try:
+        scene1, participant1 = _build_navigation_scene()
+        runner1 = SimulationRunner(
+            scene=scene1,
+            participant=participant1,
+            renderer=None,
+            dt_ms=100,
+            max_steps=3,
+            wheel_loader_planner={
+                "mode": "ppo",
+                "checkpoint_path": str(checkpoint_path),
+                "ppo_root": str(ppo_root),
+                "replan_every_steps": 1,
+                "deterministic": True,
+            },
+        )
+
+        scene2, participant2 = _build_navigation_scene()
+        runner2 = SimulationRunner(
+            scene=scene2,
+            participant=participant2,
+            renderer=None,
+            dt_ms=100,
+            max_steps=3,
+            wheel_loader_planner={
+                "mode": "ppo",
+                "checkpoint_path": str(checkpoint_path),
+                "ppo_root": str(ppo_root),
+                "replan_every_steps": 1,
+                "deterministic": True,
+            },
+        )
+    finally:
+        PPOPrimitivePathPlanner.clear_runtime_asset_cache()
+
+    assert load_calls == 1
+    assert runner1.wheel_loader_planner is not None
+    assert runner2.wheel_loader_planner is not None
+    assert runner1.wheel_loader_planner.runtime_asset_cache_hit is False
+    assert runner2.wheel_loader_planner.runtime_asset_cache_hit is True
+    assert runner1.wheel_loader_planner.agent is not runner2.wheel_loader_planner.agent
+    assert runner1.last_planning_result is not None
+    assert runner2.last_planning_result is not None
+    assert runner2.scene.metadata["reference_path_source"] == "ppo_primitive_global_plan"
+
+
+@pytest.mark.render
+def test_wheel_loader_stress_suite_reports_success_and_timing():
+    checkpoint_path, ppo_root = _ppo_assets()
+
+    report = run_wheel_loader_stress_suite(
+        checkpoint_path=str(checkpoint_path),
+        levels=["Normal"],
+        episodes_per_level=1,
+        seed=7,
+        ppo_root=str(ppo_root),
+        mode="background",
+        max_steps=5,
+    )
+
+    assert report["summary"]["episodes"] == 1
+    assert report["per_level"]["Normal"]["episodes"] == 1
+    assert "success_rate" in report["per_level"]["Normal"]
+    assert "inference_time_ms" in report["per_level"]["Normal"]
+    assert report["per_level"]["Normal"]["inference_time_ms"]["mean_ms"] is not None
+    assert report["episodes"][0]["planning_calls"] >= 1
 
 
 @pytest.mark.render

@@ -214,6 +214,32 @@ pytest tests/[test_file_name]::[test_function_name]
 
 ### Racing cases (Self-generated)
 
+## Wheel Loader Checkpoint Stress Test
+
+The wheel loader PPO bridge already supports random scene generation, closed-loop checkpoint inference, and pygame headless rendering. The recommended stress-test entrypoint is:
+
+```bash
+cd tactics2d-articulated_Vehicle
+python examples/wheel_loader_stress_test.py \
+  --checkpoint /home/cyberbus/Public/BestCheckPoint/PPO_best.pt \
+  --ppo-root /home/cyberbus/Public/PPO_articulated_vehicle \
+  --levels Normal Complex Extrem \
+  --episodes-per-level 20 \
+  --mode background \
+  --output wheel_loader_stress_report.json
+```
+
+Use `--mode visual` to show the pygame window and the planned reference path. Use `--mode background` to hide the window while keeping the same rollout logic.
+
+The report includes:
+
+- planning success rate per difficulty level (`Normal`, `Complex`, `Extrem`)
+- final status counts (`goal_reached`, `collision`, `out_of_bounds`, `max_steps`)
+- average rollout steps and episode wall time
+- checkpoint inference latency statistics for each planning call (`mean`, `p50`, `p95`, `max` in milliseconds)
+
+The stress test reuses the existing interfaces in [tactics2d/map/generator/generate_wheel_loader_scenario.py](tactics2d/map/generator/generate_wheel_loader_scenario.py), [tactics2d/renderer/ppo_primitive_bridge.py](tactics2d/renderer/ppo_primitive_bridge.py), and [tactics2d/renderer/pygame_runtime.py](tactics2d/renderer/pygame_runtime.py) instead of introducing a separate simulation stack.
+
 ## Citation
 
 If you find `tactics2d` useful, please cite this in your publication.

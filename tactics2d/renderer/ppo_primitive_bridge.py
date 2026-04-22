@@ -3,6 +3,7 @@ import json
 import math
 import os
 import sys
+import time
 import warnings
 from collections import Counter
 from copy import deepcopy
@@ -273,6 +274,8 @@ class PPOPlanningResult:
 
 
 class PPOPrimitivePathPlanner:
+    _RUNTIME_ASSET_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
     def __init__(
         self,
         checkpoint_path: str,
@@ -311,20 +314,19 @@ class PPOPrimitivePathPlanner:
         self._adaptive_round_selection_counts: Counter = Counter()
         self._primitive_meta_by_id: Dict[int, Dict[str, Any]] = {}
         self._adaptive_primitive_ids = set()
+        self.runtime_asset_cache_hit = False
 
         self.ppo_configs = self.modules["configs"]
         self._load_runtime_assets()
 
-    @staticmethod
-    def _normalize_action_mask_mode(mode: object) -> str:
-        normalized = str(mode).strip().lower()
-        if normalized == "hyrbid":
-            normalized = "hybrid"
-        if normalized not in {"fast_only", "hybrid", "full"}:
-            normalized = "hybrid"
-        return normalized
+    @classmethod
+    def clear_runtime_asset_cache(cls) -> None:
+        cls._RUNTIME_ASSET_CACHE.clear()
 
-    def _load_runtime_assets(self):
+    def _runtime_asset_cache_key(self) -> Tuple[str, str]:
+        return (self.checkpoint_path, self.ppo_root)
+
+    def _build_runtime_assets(self) -> Dict[str, Any]:
         checkpoint = _load_checkpoint(self.checkpoint_path, map_location="cpu")
         checkpoint_configs = _extract_checkpoint_configs(checkpoint)
         actor_output_size = _infer_actor_output_size(checkpoint)
@@ -391,43 +393,128 @@ class PPOPrimitivePathPlanner:
         }
 
         ppo_agent_cls = self.modules["ppo_agent"].PPOAgent
-        lidar_cls = self.modules["lidar"].LidarSimlator
+        self.modules["lidar"].LidarSimlator
         guidance_cls = self.modules["guidance"].SoftGlobalGuidance
 
-        self.agent = ppo_agent_cls(agent_configs, discrete=True, load_params=True)
-        _restore_agent_for_inference(self.agent, checkpoint)
-        self.primitive_library = primitive_library
-        self.primitive_library_path = str(Path(library_path).resolve())
-        self._load_primitive_metadata(self.primitive_library_path)
-        self.observation_dim = int(observation_shape[0])
-        self.primitive_interval_ms = primitive_interval_ms
-        self.lidar = lidar_cls(float(self.ppo_configs.LIDAR_RANGE), int(self.ppo_configs.LIDAR_NUM))
-        self._front_box = build_front_vehicle_box(
+        agent = ppo_agent_cls(agent_configs, discrete=True, load_params=True)
+        _restore_agent_for_inference(agent, checkpoint)
+
+        primitive_library_path = str(Path(library_path).resolve())
+        primitive_meta_by_id, adaptive_primitive_ids = self._build_primitive_metadata(
+            primitive_library,
+            primitive_library_path,
+        )
+        front_box = build_front_vehicle_box(
             width=PPO_WIDTH,
             hitch_offset=PPO_HITCH_OFFSET,
             front_overhang=PPO_FRONT_OVERHANG,
         )
-        self._rear_box = build_rear_vehicle_box(
+        rear_box = build_rear_vehicle_box(
             width=PPO_WIDTH,
             trailer_length=PPO_TRAILER_LENGTH,
             rear_overhang=PPO_REAR_OVERHANG,
         )
-        self.global_guidance = None
+        guidance_kwargs = None
         if bool(getattr(self.ppo_configs, "ENABLE_GLOBAL_SOFT_GUIDANCE", False)):
-            self.global_guidance = guidance_cls(
-                grid_resolution=float(self.ppo_configs.GUIDANCE_GRID_RESOLUTION),
-                obstacle_inflation=float(self.ppo_configs.GUIDANCE_OBS_INFLATION),
-                map_margin=float(self.ppo_configs.GUIDANCE_MAP_MARGIN),
-                lookahead_base=float(self.ppo_configs.GUIDANCE_LOOKAHEAD_BASE),
-                lookahead_speed_gain=float(self.ppo_configs.GUIDANCE_LOOKAHEAD_SPEED_GAIN),
-                lookahead_min=float(self.ppo_configs.GUIDANCE_LOOKAHEAD_MIN),
-                lookahead_max=float(self.ppo_configs.GUIDANCE_LOOKAHEAD_MAX),
-                progress_search_window=int(self.ppo_configs.GUIDANCE_PROGRESS_WINDOW),
-                min_clearance_m=float(self.ppo_configs.GUIDANCE_MIN_CLEARANCE_M),
-                full_clearance_m=float(self.ppo_configs.GUIDANCE_FULL_CLEARANCE_M),
-                near_obs_dist_m=float(self.ppo_configs.GUIDANCE_NEAR_OBS_DIST_M),
-                max_dense_ratio=float(self.ppo_configs.GUIDANCE_MAX_DENSE_RATIO),
-            )
+            guidance_kwargs = {
+                "grid_resolution": float(self.ppo_configs.GUIDANCE_GRID_RESOLUTION),
+                "obstacle_inflation": float(self.ppo_configs.GUIDANCE_OBS_INFLATION),
+                "map_margin": float(self.ppo_configs.GUIDANCE_MAP_MARGIN),
+                "lookahead_base": float(self.ppo_configs.GUIDANCE_LOOKAHEAD_BASE),
+                "lookahead_speed_gain": float(self.ppo_configs.GUIDANCE_LOOKAHEAD_SPEED_GAIN),
+                "lookahead_min": float(self.ppo_configs.GUIDANCE_LOOKAHEAD_MIN),
+                "lookahead_max": float(self.ppo_configs.GUIDANCE_LOOKAHEAD_MAX),
+                "progress_search_window": int(self.ppo_configs.GUIDANCE_PROGRESS_WINDOW),
+                "min_clearance_m": float(self.ppo_configs.GUIDANCE_MIN_CLEARANCE_M),
+                "full_clearance_m": float(self.ppo_configs.GUIDANCE_FULL_CLEARANCE_M),
+                "near_obs_dist_m": float(self.ppo_configs.GUIDANCE_NEAR_OBS_DIST_M),
+                "max_dense_ratio": float(self.ppo_configs.GUIDANCE_MAX_DENSE_RATIO),
+            }
+
+        return {
+            "agent": agent,
+            "primitive_library": primitive_library,
+            "primitive_library_path": primitive_library_path,
+            "observation_dim": int(observation_shape[0]),
+            "primitive_interval_ms": primitive_interval_ms,
+            "front_box": front_box,
+            "rear_box": rear_box,
+            "primitive_meta_by_id": primitive_meta_by_id,
+            "adaptive_primitive_ids": adaptive_primitive_ids,
+            "guidance_cls": guidance_cls,
+            "guidance_kwargs": guidance_kwargs,
+        }
+
+    def _apply_runtime_assets(self, runtime_assets: Dict[str, Any]) -> None:
+        self.agent = deepcopy(runtime_assets["agent"])
+        self.primitive_library = runtime_assets["primitive_library"]
+        self.primitive_library_path = runtime_assets["primitive_library_path"]
+        self.observation_dim = int(runtime_assets["observation_dim"])
+        self.primitive_interval_ms = int(runtime_assets["primitive_interval_ms"])
+        self._front_box = runtime_assets["front_box"]
+        self._rear_box = runtime_assets["rear_box"]
+        self._primitive_meta_by_id = deepcopy(runtime_assets["primitive_meta_by_id"])
+        self._adaptive_primitive_ids = set(runtime_assets["adaptive_primitive_ids"])
+        lidar_cls = self.modules["lidar"].LidarSimlator
+        self.lidar = lidar_cls(float(self.ppo_configs.LIDAR_RANGE), int(self.ppo_configs.LIDAR_NUM))
+        self.global_guidance = None
+        guidance_kwargs = runtime_assets.get("guidance_kwargs")
+        guidance_cls = runtime_assets.get("guidance_cls")
+        if guidance_cls is not None and guidance_kwargs is not None:
+            self.global_guidance = guidance_cls(**guidance_kwargs)
+        self._guidance_points_signature = None
+        self._action_mask_cached = None
+        self._action_mask_calls_since_update = 0
+
+    @staticmethod
+    def _build_primitive_metadata(primitive_library, library_path: str) -> Tuple[Dict[int, Dict[str, Any]], set]:
+        primitive_meta = _load_primitive_sidecar_meta(library_path)
+        primitive_meta_by_id: Dict[int, Dict[str, Any]] = {}
+        adaptive_primitive_ids = set()
+
+        for default_primitive_id in range(int(primitive_library.size)):
+            primitive_meta_by_id[default_primitive_id] = {
+                "primitive_id": int(default_primitive_id),
+                "added_round": None,
+            }
+
+        for default_primitive_id, item in enumerate(primitive_meta):
+            primitive_id = int(item.get("primitive_id", default_primitive_id))
+            normalized_item = dict(item)
+            added_round = normalized_item.get("added_round")
+            if added_round is not None:
+                try:
+                    added_round = int(added_round)
+                except Exception:
+                    added_round = None
+            normalized_item["added_round"] = added_round
+            normalized_item["primitive_id"] = primitive_id
+            primitive_meta_by_id[primitive_id] = normalized_item
+            if added_round is not None and added_round >= 0:
+                adaptive_primitive_ids.add(primitive_id)
+
+        return primitive_meta_by_id, adaptive_primitive_ids
+
+    @staticmethod
+    def _normalize_action_mask_mode(mode: object) -> str:
+        normalized = str(mode).strip().lower()
+        if normalized == "hyrbid":
+            normalized = "hybrid"
+        if normalized not in {"fast_only", "hybrid", "full"}:
+            normalized = "hybrid"
+        return normalized
+
+    def _load_runtime_assets(self):
+        cache_key = self._runtime_asset_cache_key()
+        runtime_assets = self._RUNTIME_ASSET_CACHE.get(cache_key)
+        if runtime_assets is None:
+            runtime_assets = self._build_runtime_assets()
+            self._RUNTIME_ASSET_CACHE[cache_key] = runtime_assets
+            self.runtime_asset_cache_hit = False
+        else:
+            self.runtime_asset_cache_hit = True
+
+        self._apply_runtime_assets(runtime_assets)
 
     def _obstacle_geometries(self, scene) -> List[Any]:
         geometries = []
@@ -637,30 +724,10 @@ class PPOPrimitivePathPlanner:
         return primitive_id, primitive_actions, rollout_states, action_mask
 
     def _load_primitive_metadata(self, library_path: str) -> None:
-        primitive_meta = _load_primitive_sidecar_meta(library_path)
-        self._primitive_meta_by_id = {}
-        self._adaptive_primitive_ids = set()
-
-        for default_primitive_id in range(int(self.primitive_library.size)):
-            self._primitive_meta_by_id[default_primitive_id] = {
-                "primitive_id": int(default_primitive_id),
-                "added_round": None,
-            }
-
-        for default_primitive_id, item in enumerate(primitive_meta):
-            primitive_id = int(item.get("primitive_id", default_primitive_id))
-            normalized_item = dict(item)
-            added_round = normalized_item.get("added_round")
-            if added_round is not None:
-                try:
-                    added_round = int(added_round)
-                except Exception:
-                    added_round = None
-            normalized_item["added_round"] = added_round
-            normalized_item["primitive_id"] = primitive_id
-            self._primitive_meta_by_id[primitive_id] = normalized_item
-            if added_round is not None and added_round >= 0:
-                self._adaptive_primitive_ids.add(primitive_id)
+        self._primitive_meta_by_id, self._adaptive_primitive_ids = self._build_primitive_metadata(
+            self.primitive_library,
+            library_path,
+        )
 
     def _primitive_metadata(self, primitive_id: int) -> Dict[str, Any]:
         return dict(self._primitive_meta_by_id.get(int(primitive_id), {"primitive_id": int(primitive_id), "added_round": None}))
@@ -808,6 +875,7 @@ class PPOPrimitivePathPlanner:
         }
 
     def plan(self, scene, participant) -> PPOPlanningResult:
+        plan_started_at = time.perf_counter()
         planning_state = participant.physics_model.ensure_articulated_state(participant.current_state)
         observation = self.build_observation(scene, participant, state=planning_state)
         primitive_id, primitive_actions, rollout_states, action_mask = self._choose_closed_loop_primitive(
@@ -846,6 +914,7 @@ class PPOPrimitivePathPlanner:
         metadata["replan_every_steps"] = int(self.replan_every_steps)
         control_actions = self._expand_primitive_controls(primitive_actions)
         metadata["control_actions_shape"] = tuple(int(dim) for dim in control_actions.shape)
+        metadata["plan_runtime_ms"] = float((time.perf_counter() - plan_started_at) * 1000.0)
         return PPOPlanningResult(
             primitive_id=int(primitive_id),
             primitive_actions=primitive_actions,

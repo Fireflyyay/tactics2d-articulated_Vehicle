@@ -525,6 +525,7 @@ class SimulationRunner:
         self.last_planning_step = -1
         self.pending_primitive_controls = []
         self.pending_primitive_control_index = 0
+        self.planning_history = []
 
         if scene.participant_kind == "wheel_loader":
             controller_cls = ArticulatedPurePursuitController or _FallbackArticulatedPurePursuitController
@@ -580,6 +581,14 @@ class SimulationRunner:
             "ppo_primitive_global_plan",
         )
         self.last_planning_step = self.current_step
+        self.planning_history.append(
+            {
+                "step": int(self.current_step),
+                "runtime_ms": float(planning_result.metadata.get("plan_runtime_ms", 0.0)),
+                "primitive_id": int(planning_result.primitive_id),
+                "control_actions": int(len(planning_result.control_actions)),
+            }
+        )
 
     def _maybe_replan_reference(self):
         if self.wheel_loader_planner is None:
@@ -768,6 +777,9 @@ class SimulationRunner:
             )
             if self.last_planning_result is not None:
                 lines.append(f"primitive={self.last_planning_result.primitive_id}")
+                lines.append(
+                    f"plan_ms={self.last_planning_result.metadata.get('plan_runtime_ms', 0.0):.2f}"
+                )
                 lines.append(
                     f"primitive_selected={self.last_planning_result.metadata.get('primitive_selected_count', 0)}"
                 )
