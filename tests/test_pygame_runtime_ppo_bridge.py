@@ -66,6 +66,25 @@ def test_ppo_primitive_planner_builds_reference():
     assert result.metadata["action_mask_feasible_count"] > 0
     assert len(result.metadata["primitive_sequence"]) == 1
     assert result.metadata["control_actions_shape"] == result.control_actions.shape
+    assert result.metadata["primitive_selected_count"] == 1
+    assert result.metadata["primitive_selection_counts"][result.primitive_id] == 1
+    assert result.metadata["adaptive_selected_count_total"] == sum(result.metadata["adaptive_primitive_selection_counts"].values())
+    assert result.metadata["primitive_origin"] in {"adaptive", "base", "unknown"}
+    if result.metadata["primitive_origin"] == "adaptive":
+        assert result.metadata["primitive_added_round"] is not None
+        assert result.metadata["adaptive_selected_count_total"] == 1
+    else:
+        assert result.metadata["primitive_added_round"] is None
+
+    second_result = planner.plan(scene, participant)
+
+    assert second_result.metadata["primitive_selected_count"] >= 1
+    assert second_result.metadata["primitive_selection_counts"][second_result.primitive_id] == second_result.metadata["primitive_selected_count"]
+    assert sum(second_result.metadata["primitive_selection_counts"].values()) == 2
+    assert second_result.metadata["adaptive_selected_count_total"] == sum(second_result.metadata["adaptive_primitive_selection_counts"].values())
+    if second_result.metadata["primitive_origin"] == "adaptive":
+        assert second_result.metadata["primitive_added_round"] is not None
+        assert second_result.metadata["adaptive_round_selection_counts"][second_result.metadata["primitive_added_round"]] >= 1
 
 
 @pytest.mark.render
@@ -102,6 +121,10 @@ def test_simulation_runner_consumes_ppo_reference():
     assert runner.last_planning_result.metadata["planning_mode"] == "closed_loop_policy"
     assert runner.last_planning_result.metadata["action_mask_used"] is True
     assert runner.last_planning_result.metadata["action_mask_feasible_count"] > 0
+    assert runner.last_planning_result.metadata["primitive_selected_count"] >= 1
+    assert runner.last_planning_result.metadata["adaptive_selected_count_total"] == sum(
+        runner.last_planning_result.metadata["adaptive_primitive_selection_counts"].values()
+    )
     assert runner.last_planning_step == 0
     assert runner.scene.reference_path.length > 0.0
     assert planned_length > 0.0
@@ -114,6 +137,11 @@ def test_simulation_runner_consumes_ppo_reference():
     runner.step_once()
 
     assert runner.last_planning_step == 1
+    assert sum(runner.last_planning_result.metadata["primitive_selection_counts"].values()) == 2
+    assert (
+        runner.last_planning_result.metadata["primitive_selection_counts"][runner.last_planning_result.primitive_id]
+        == runner.last_planning_result.metadata["primitive_selected_count"]
+    )
 
 
 @pytest.mark.render

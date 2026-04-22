@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import warnings
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,22 @@ from tactics2d.utils.ppo_articulated_defaults import (
 
 
 _PPO_IMPORT_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _load_primitive_sidecar_meta(npz_path: str) -> List[Dict[str, Any]]:
+    sidecar_path = Path(npz_path).with_name(f"{Path(npz_path).stem}_meta.json")
+    if not sidecar_path.exists():
+        return []
+
+    try:
+        with sidecar_path.open("r", encoding="utf-8") as file_obj:
+            payload = json.load(file_obj)
+    except Exception:
+        return []
+
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
 
 
 def _load_checkpoint(path: str, map_location: str = "cpu"):
@@ -289,6 +306,11 @@ class PPOPrimitivePathPlanner:
         )
         self._action_mask_cached: Optional[np.ndarray] = None
         self._action_mask_calls_since_update = 0
+        self._primitive_selection_counts: Counter = Counter()
+        self._adaptive_primitive_selection_counts: Counter = Counter()
+        self._adaptive_round_selection_counts: Counter = Counter()
+        self._primitive_meta_by_id: Dict[int, Dict[str, Any]] = {}
+        self._adaptive_primitive_ids = set()
 
         self.ppo_configs = self.modules["configs"]
         self._load_runtime_assets()
@@ -376,6 +398,7 @@ class PPOPrimitivePathPlanner:
         _restore_agent_for_inference(self.agent, checkpoint)
         self.primitive_library = primitive_library
         self.primitive_library_path = str(Path(library_path).resolve())
+        self._load_primitive_metadata(self.primitive_library_path)
         self.observation_dim = int(observation_shape[0])
         self.primitive_interval_ms = primitive_interval_ms
         self.lidar = lidar_cls(float(self.ppo_configs.LIDAR_RANGE), int(self.ppo_configs.LIDAR_NUM))
@@ -613,6 +636,42 @@ class PPOPrimitivePathPlanner:
 
         return primitive_id, primitive_actions, rollout_states, action_mask
 
+    def _load_primitive_metadata(self, library_path: str) -> None:
+        primitive_meta = _load_primitive_sidecar_meta(library_path)
+        self._primitive_meta_by_id = {}
+        self._adaptive_primitive_ids = set()
+
+        for default_primitive_id in range(int(self.primitive_library.size)):
+            self._primitive_meta_by_id[default_primitive_id] = {
+                "primitive_id": int(default_primitive_id),
+                "added_round": None,
+            }
+
+        for default_primitive_id, item in enumerate(primitive_meta):
+            primitive_id = int(item.get("primitive_id", default_primitive_id))
+            normalized_item = dict(item)
+            added_round = normalized_item.get("added_round")
+            if added_round is not None:
+                try:
+                    added_round = int(added_round)
+                except Exception:
+                    added_round = None
+            normalized_item["added_round"] = added_round
+            normalized_item["primitive_id"] = primitive_id
+            self._primitive_meta_by_id[primitive_id] = normalized_item
+            if added_round is not None and added_round >= 0:
+                self._adaptive_primitive_ids.add(primitive_id)
+
+    def _primitive_metadata(self, primitive_id: int) -> Dict[str, Any]:
+        return dict(self._primitive_meta_by_id.get(int(primitive_id), {"primitive_id": int(primitive_id), "added_round": None}))
+
+    def _primitive_origin(self, primitive_id: int) -> str:
+        if int(primitive_id) in self._adaptive_primitive_ids:
+            return "adaptive"
+        if self._primitive_meta_by_id:
+            return "base"
+        return "unknown"
+
     def _rollout_primitive(self, participant, primitive_actions: np.ndarray, state: Optional[ArticulatedState] = None) -> List[ArticulatedState]:
         physics_model = participant.physics_model
         rollout_source = participant.current_state if state is None else state
@@ -730,6 +789,24 @@ class PPOPrimitivePathPlanner:
             metadata=metadata,
         )
 
+    def get_primitive_selection_counts(self) -> Dict[int, int]:
+        return {
+            int(primitive_id): int(count)
+            for primitive_id, count in sorted(self._primitive_selection_counts.items())
+        }
+
+    def get_adaptive_primitive_selection_counts(self) -> Dict[int, int]:
+        return {
+            int(primitive_id): int(count)
+            for primitive_id, count in sorted(self._adaptive_primitive_selection_counts.items())
+        }
+
+    def get_adaptive_round_selection_counts(self) -> Dict[int, int]:
+        return {
+            int(round_id): int(count)
+            for round_id, count in sorted(self._adaptive_round_selection_counts.items())
+        }
+
     def plan(self, scene, participant) -> PPOPlanningResult:
         planning_state = participant.physics_model.ensure_articulated_state(participant.current_state)
         observation = self.build_observation(scene, participant, state=planning_state)
@@ -739,11 +816,28 @@ class PPOPrimitivePathPlanner:
             planning_state,
             observation,
         )
+        self._primitive_selection_counts[int(primitive_id)] += 1
+        primitive_meta = self._primitive_metadata(int(primitive_id))
+        primitive_added_round = primitive_meta.get("added_round")
+        primitive_origin = self._primitive_origin(int(primitive_id))
+        if primitive_origin == "adaptive":
+            self._adaptive_primitive_selection_counts[int(primitive_id)] += 1
+            if primitive_added_round is not None:
+                self._adaptive_round_selection_counts[int(primitive_added_round)] += 1
 
         reference = self._reference_from_rollout(rollout_states, [primitive_id], observation)
         metadata = dict(reference.metadata)
         metadata["primitive_actions_shape"] = tuple(int(dim) for dim in primitive_actions.shape)
         metadata["primitive_id"] = int(primitive_id)
+        metadata["primitive_selected_count"] = int(self._primitive_selection_counts[int(primitive_id)])
+        metadata["primitive_selection_counts"] = self.get_primitive_selection_counts()
+        metadata["primitive_origin"] = primitive_origin
+        metadata["primitive_added_round"] = primitive_added_round if primitive_origin == "adaptive" else None
+        metadata["adaptive_library_size"] = int(len(self._adaptive_primitive_ids))
+        metadata["base_library_size"] = int(max(int(self.primitive_library.size) - len(self._adaptive_primitive_ids), 0))
+        metadata["adaptive_selected_count_total"] = int(sum(self._adaptive_primitive_selection_counts.values()))
+        metadata["adaptive_primitive_selection_counts"] = self.get_adaptive_primitive_selection_counts()
+        metadata["adaptive_round_selection_counts"] = self.get_adaptive_round_selection_counts()
         metadata["planning_mode"] = "closed_loop_policy"
         metadata["action_mask_used"] = bool(self.use_action_mask)
         metadata["action_mask_mode"] = self.action_mask_mode

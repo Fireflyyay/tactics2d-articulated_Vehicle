@@ -768,6 +768,18 @@ class SimulationRunner:
             )
             if self.last_planning_result is not None:
                 lines.append(f"primitive={self.last_planning_result.primitive_id}")
+                lines.append(
+                    f"primitive_selected={self.last_planning_result.metadata.get('primitive_selected_count', 0)}"
+                )
+                primitive_origin = self.last_planning_result.metadata.get("primitive_origin", "unknown")
+                primitive_added_round = self.last_planning_result.metadata.get("primitive_added_round")
+                if primitive_origin == "adaptive" and primitive_added_round is not None:
+                    lines.append(f"primitive_origin=adaptive(round={primitive_added_round})")
+                else:
+                    lines.append(f"primitive_origin={primitive_origin}")
+                lines.append(
+                    f"adaptive_selected={self.last_planning_result.metadata.get('adaptive_selected_count_total', 0)}"
+                )
                 primitive_sequence = self.last_planning_result.metadata.get("primitive_sequence", [])
                 lines.append(f"planned_primitives={len(primitive_sequence)}")
             if self.last_planning_error:
