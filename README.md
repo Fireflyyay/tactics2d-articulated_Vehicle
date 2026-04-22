@@ -214,31 +214,78 @@ pytest tests/[test_file_name]::[test_function_name]
 
 ### Racing cases (Self-generated)
 
-## Wheel Loader Checkpoint Stress Test
+## Wheel Loader PPO Primitive Runtime
 
-The wheel loader PPO bridge already supports random scene generation, closed-loop checkpoint inference, and pygame headless rendering. The recommended stress-test entrypoint is:
+The wheel loader runtime now supports loading PPO checkpoints from `PPO_articulated_vehicle`, selecting a primitive online, converting the primitive rollout into a short-horizon reference, and tracking it inside the native `tactics2d` pygame simulation loop.
+
+Before running the examples below, make sure the workspace contains:
+
+- `PPO_articulated_vehicle`
+- `BestCheckPoint/PPO_best.pt`
+- `BestCheckPoint/adaptive_primitives/active_version.json`
+
+### Interactive pygame playback
+
+Use the scene player when you want to inspect a single generated scene, visualize the planned reference, and watch the wheel loader execute the PPO-guided maneuver.
+
+```bash
+cd tactics2d-articulated_Vehicle
+PYGAME_HIDE_SUPPORT_PROMPT=1 python examples/pygame_scene_player.py \
+  --scene wheel_loader \
+  --backend ppo \
+  --scene-type navigation \
+  --map-level Normal \
+  --wheel-loader-planner ppo \
+  --ppo-checkpoint /Users/firefly/Desktop/Research/Codes/BestCheckPoint/PPO_best.pt \
+  --ppo-root /Users/firefly/Desktop/Research/Codes/PPO_articulated_vehicle
+```
+
+Common options:
+
+- `--scene-type {navigation,bay,parallel}` switches the generated task family.
+- `--map-level` selects the difficulty level for the PPO-backed wheel loader generator.
+- `--wheel-loader-planner ppo` enables online primitive planning. The default value `default` keeps the built-in reference path.
+- `--ppo-stochastic` enables stochastic action sampling. By default, inference is deterministic.
+- `--ppo-root` is optional when `PPO_articulated_vehicle` is discoverable from the current workspace.
+
+Notes:
+
+- The example script prepends the repository root to `sys.path`, so it prefers the local `tactics2d` sources when launched from this repo.
+- PPO integration is currently scoped to the `wheel_loader` scene with the `ppo` generator backend.
+- If PPO planning cannot produce a valid short-horizon reference, the runtime falls back to the base guidance/reference path instead of aborting the scene.
+
+For a quick non-visual verification of the same bridge, run:
+
+```bash
+python -m pytest tests/test_pygame_runtime_ppo_bridge.py -q
+```
+
+### Checkpoint stress test
+
+Use the stress-test entrypoint to batch random scenes across multiple difficulty levels and summarize checkpoint quality:
 
 ```bash
 cd tactics2d-articulated_Vehicle
 python examples/wheel_loader_stress_test.py \
-  --checkpoint /home/cyberbus/Public/BestCheckPoint/PPO_best.pt \
-  --ppo-root /home/cyberbus/Public/PPO_articulated_vehicle \
+  --checkpoint /Users/firefly/Desktop/Research/Codes/BestCheckPoint/PPO_best.pt \
+  --ppo-root /Users/firefly/Desktop/Research/Codes/PPO_articulated_vehicle \
   --levels Normal Complex Extrem \
-  --episodes-per-level 20 \
-  --mode background \
-  --output wheel_loader_stress_report.json
+  --episodes-per-level 1 \
+  --mode visual \
+  --scene-type navigation \
+  --replan-every-steps 5
 ```
 
-Use `--mode visual` to show the pygame window and the planned reference path. Use `--mode background` to hide the window while keeping the same rollout logic.
+Use `--mode visual` to show the pygame window and the planned reference path. Use `--mode background` to hide the window while keeping the same rollout logic. Add `--output stress_report.json` if you want to save the full report.
 
 The report includes:
 
 - planning success rate per difficulty level (`Normal`, `Complex`, `Extrem`)
 - final status counts (`goal_reached`, `collision`, `out_of_bounds`, `max_steps`)
-- average rollout steps and episode wall time
+- average rollout steps, planning calls, and episode wall time
 - checkpoint inference latency statistics for each planning call (`mean`, `p50`, `p95`, `max` in milliseconds)
 
-The stress test reuses the existing interfaces in [tactics2d/map/generator/generate_wheel_loader_scenario.py](tactics2d/map/generator/generate_wheel_loader_scenario.py), [tactics2d/renderer/ppo_primitive_bridge.py](tactics2d/renderer/ppo_primitive_bridge.py), and [tactics2d/renderer/pygame_runtime.py](tactics2d/renderer/pygame_runtime.py) instead of introducing a separate simulation stack.
+The stress test reuses the same runtime stack as the interactive player through [tactics2d/map/generator/generate_wheel_loader_scenario.py](tactics2d/map/generator/generate_wheel_loader_scenario.py), [tactics2d/renderer/ppo_primitive_bridge.py](tactics2d/renderer/ppo_primitive_bridge.py), [tactics2d/renderer/pygame_runtime.py](tactics2d/renderer/pygame_runtime.py), and [tactics2d/renderer/wheel_loader_stress.py](tactics2d/renderer/wheel_loader_stress.py).
 
 ## Citation
 

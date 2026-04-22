@@ -117,59 +117,99 @@ pip install -v .
 git submodule update --init --recursive
 ```
 
-#### 3.1 Wheel Loader 场景的 PPO primitive 规划可视化
+#### 3.1 Wheel Loader 场景的 PPO primitive 在线规划
 
-当前仓库已经支持在`tactics2d`内部直接加载 PPO_articulated_vehicle 的策略权重和 primitive 库，用于 wheel loader 导航场景的在线重规划。第一阶段实现方式是：PPO 策略输出 primitive，随后在`tactics2d`中将 primitive rollout 转成短时参考轨迹，再交给现有跟踪器进行跟踪与可视化。
+当前仓库已经支持在`tactics2d`内部直接加载`PPO_articulated_vehicle`的策略权重和 primitive 库，用于 wheel loader 场景的在线重规划。运行时链路为：PPO 策略先选择 primitive，再将 primitive rollout 转成短时参考轨迹，最后交给`tactics2d`现有的跟踪与渲染链路执行。
 
-运行前请确认以下目录关系存在：
+运行前请确认工作区中存在以下内容：
 
-- 仓库根目录下存在`PPO_articulated_vehicle`
-- 仓库根目录下存在`BestCheckPoint`
-- `BestCheckPoint`目录中包含`PPO_best.pt`
-- `BestCheckPoint/adaptive_primitives/active_version.json`指向可用的 primitive 库版本
+- `PPO_articulated_vehicle`
+- `BestCheckPoint/PPO_best.pt`
+- `BestCheckPoint/adaptive_primitives/active_version.json`
 
-推荐在仓库根目录内使用已有环境直接运行：
+#### 3.2 交互式 pygame 可视化
 
-```bash
-cd tactics2d-articulated_Vehicle
-PYGAME_HIDE_SUPPORT_PROMPT=1 conda run -n ppomp python examples/pygame_scene_player.py \
-  --scene wheel_loader \
-  --backend ppo \
-  --wheel-loader-planner ppo \
-  --ppo-checkpoint /Users/firefly/Desktop/Research/Codes/BestCheckPoint/PPO_best.pt
-```
-
-如果你已经激活了`ppomp`环境，也可以直接运行：
+如果你想查看单个随机场景中的规划结果、参考轨迹和车辆执行过程，推荐使用`pygame_scene_player.py`：
 
 ```bash
 cd tactics2d-articulated_Vehicle
 PYGAME_HIDE_SUPPORT_PROMPT=1 python examples/pygame_scene_player.py \
   --scene wheel_loader \
   --backend ppo \
+  --scene-type navigation \
+  --map-level Normal \
   --wheel-loader-planner ppo \
-  --ppo-checkpoint /Users/firefly/Desktop/Research/Codes/BestCheckPoint/PPO_best.pt
+  --ppo-checkpoint /Users/firefly/Desktop/Research/Codes/BestCheckPoint/PPO_best.pt \
+  --ppo-root /Users/firefly/Desktop/Research/Codes/PPO_articulated_vehicle
+```
+
+如果你希望显式指定环境，也可以这样运行：
+
+```bash
+cd tactics2d-articulated_Vehicle
+PYGAME_HIDE_SUPPORT_PROMPT=1 conda run -n ppomp python examples/pygame_scene_player.py \
+  --scene wheel_loader \
+  --backend ppo \
+  --scene-type navigation \
+  --map-level Normal \
+  --wheel-loader-planner ppo \
+  --ppo-checkpoint /Users/firefly/Desktop/Research/Codes/BestCheckPoint/PPO_best.pt \
+  --ppo-root /Users/firefly/Desktop/Research/Codes/PPO_articulated_vehicle
 ```
 
 常用参数说明：
 
-- `--wheel-loader-planner ppo`：启用 PPO primitive 规划模式；如果不传，默认仍使用原有跟踪链路
+- `--scene-type {navigation,bay,parallel}`：切换生成的 wheel loader 任务类型
+- `--map-level`：选择 PPO 场景生成器的难度等级
+- `--wheel-loader-planner ppo`：启用 PPO primitive 在线规划；默认值`default`会保留原有参考轨迹
 - `--ppo-checkpoint`：指定 PPO 权重文件路径
-- `--backend ppo`：使用 PPO 风格的导航场景生成器
 - `--ppo-root`：当`PPO_articulated_vehicle`不在默认相对位置时，可手动指定 PPO 仓库根目录
-- `--ppo-replan-every`：设置每隔多少个仿真步重规划一次，默认值为`1`
-- `--ppo-stochastic`：默认是 deterministic 推理；传入该参数后使用随机采样动作
+- `--ppo-stochastic`：默认使用 deterministic 推理；传入该参数后改为随机采样动作
 
 说明：
 
-- 示例脚本现在会优先导入当前仓库内的本地`tactics2d`源码，因此建议从仓库目录运行，而不是在其他目录中调用脚本
-- 当前 PPO 接入主要面向`wheel_loader + navigation + backend=ppo`组合
-- 如果 PPO 规划失败，运行时会回退到现有的 guidance/reference 轨迹，不会阻塞示例启动
+- 示例脚本会优先导入当前仓库内的本地`tactics2d`源码，因此建议从仓库目录运行
+- 当前 PPO 接入主要面向`wheel_loader + backend=ppo`组合
+- 如果 PPO 规划无法生成有效的短时参考轨迹，运行时会自动回退到基础 guidance/reference path，不会直接中断示例
 
 如果你只想做无窗口快速验证，可以运行对应测试：
 
 ```bash
-conda run -n ppomp python -m pytest tests/test_pygame_runtime_ppo_bridge.py -q
+python -m pytest tests/test_pygame_runtime_ppo_bridge.py -q
 ```
+
+#### 3.3 Checkpoint stress test
+
+如果你想批量评估 checkpoint 在不同随机场景和不同难度等级下的表现，可以使用`wheel_loader_stress_test.py`：
+
+```bash
+cd tactics2d-articulated_Vehicle
+python examples/wheel_loader_stress_test.py \
+  --checkpoint /Users/firefly/Desktop/Research/Codes/BestCheckPoint/PPO_best.pt \
+  --ppo-root /Users/firefly/Desktop/Research/Codes/PPO_articulated_vehicle \
+  --levels Normal Complex Extrem \
+  --episodes-per-level 1 \
+  --mode visual \
+  --scene-type navigation \
+  --replan-every-steps 5
+```
+
+参数说明：
+
+- `--mode visual`：显示 pygame 窗口和规划参考轨迹
+- `--mode background`：隐藏窗口，但保留同样的 rollout 逻辑，适合批量跑实验
+- `--levels`：指定难度等级列表，默认会跑`Normal`、`Complex`、`Extrem`
+- `--episodes-per-level`：每个难度等级生成并评估多少个随机场景
+- `--output`：将完整结果写入 JSON 文件，便于后处理
+
+stress test 汇总结果包含：
+
+- 各难度等级的规划成功率
+- 最终状态计数，如`goal_reached`、`collision`、`out_of_bounds`、`max_steps`
+- 平均 rollout 步数、平均规划次数和单回合耗时
+- 每次规划调用的 checkpoint 推理延迟统计，包括`mean`、`p50`、`p95`、`max`
+
+该测试复用了现有运行时链路：[tactics2d/map/generator/generate_wheel_loader_scenario.py](tactics2d/map/generator/generate_wheel_loader_scenario.py)、[tactics2d/renderer/ppo_primitive_bridge.py](tactics2d/renderer/ppo_primitive_bridge.py)、[tactics2d/renderer/pygame_runtime.py](tactics2d/renderer/pygame_runtime.py)和[tactics2d/renderer/wheel_loader_stress.py](tactics2d/renderer/wheel_loader_stress.py)，而不是额外维护一套独立仿真栈。
 
 ### 4. 更多示例
 
