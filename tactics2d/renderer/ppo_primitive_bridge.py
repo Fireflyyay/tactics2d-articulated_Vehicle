@@ -222,6 +222,7 @@ def _load_ppo_modules(ppo_root: Optional[str]) -> Dict[str, Any]:
             "guidance": importlib.import_module("env.global_guidance"),
             "lidar": importlib.import_module("env.lidar_simulator"),
             "primitives": importlib.import_module("primitives.library"),
+            "primitive_index": importlib.import_module("primitives.primitive_index"),
         }
     finally:
         if original_sdl_video_driver is None:
@@ -307,8 +308,23 @@ class PPOPrimitivePathPlanner:
         self.action_mask_mode = self._normalize_action_mask_mode(
             getattr(self.modules["configs"], "ACTION_MASK_MODE", "hybrid")
         )
+        self.mask_use_fast_prune = bool(getattr(self.modules["configs"], "ACTION_MASK_USE_FAST_PRUNE", True))
+        self.occupancy_inflation_radius = float(
+            getattr(self.modules["configs"], "OCCUPANCY_INFLATION_RADIUS", 1.8)
+        )
         self._action_mask_cached: Optional[np.ndarray] = None
         self._action_mask_calls_since_update = 0
+        self._action_mask_index = None
+        self._action_mask_index_source = "none"
+        self._action_mask_inflation_offsets: List[Tuple[int, int]] = []
+        self._last_action_mask_stats: Dict[str, Any] = {
+            "precomputed_available": False,
+            "precomputed_used": False,
+            "precomputed_candidate_count": None,
+            "precomputed_fallback_to_full": False,
+            "precomputed_index_kind": None,
+            "precomputed_index_source": "none",
+        }
         self._primitive_selection_counts: Counter = Counter()
         self._adaptive_primitive_selection_counts: Counter = Counter()
         self._adaptive_round_selection_counts: Counter = Counter()
@@ -361,6 +377,25 @@ class PPOPrimitivePathPlanner:
                 "Checkpoint actor output and primitive library size mismatch: "
                 f"actor={actor_output_size}, library={primitive_library.size}."
             )
+
+        action_mask_index = getattr(primitive_library, "mask_index", None)
+        action_mask_index_source = "library" if action_mask_index is not None else "none"
+        if action_mask_index is None and self.mask_use_fast_prune:
+            try:
+                action_mask_index = self.modules["primitive_index"].build_approx_index_from_deltas(
+                    actions=np.asarray(getattr(primitive_library, "actions"), dtype=np.float64),
+                    deltas=np.asarray(getattr(primitive_library, "deltas"), dtype=np.float64),
+                    grid_resolution=float(getattr(self.ppo_configs, "GRID_RESOLUTION", 0.3)),
+                    x_min=-6.0,
+                    x_max=12.0,
+                    y_min=-9.0,
+                    y_max=9.0,
+                    group_prefix_steps=max(1, int(round(float(primitive_library.horizon) * 0.3))),
+                )
+                action_mask_index_source = "approx"
+            except Exception:
+                action_mask_index = None
+                action_mask_index_source = "none"
 
         primitive_interval_ms = int(round(float(self.ppo_configs.NUM_STEP) * float(self.ppo_configs.STEP_LENGTH) * 1000.0))
         if primitive_interval_ms <= 0:
@@ -435,6 +470,8 @@ class PPOPrimitivePathPlanner:
             "agent": agent,
             "primitive_library": primitive_library,
             "primitive_library_path": primitive_library_path,
+            "action_mask_index": action_mask_index,
+            "action_mask_index_source": action_mask_index_source,
             "observation_dim": int(observation_shape[0]),
             "primitive_interval_ms": primitive_interval_ms,
             "front_box": front_box,
@@ -449,6 +486,8 @@ class PPOPrimitivePathPlanner:
         self.agent = deepcopy(runtime_assets["agent"])
         self.primitive_library = runtime_assets["primitive_library"]
         self.primitive_library_path = runtime_assets["primitive_library_path"]
+        self._action_mask_index = runtime_assets.get("action_mask_index")
+        self._action_mask_index_source = str(runtime_assets.get("action_mask_index_source", "none"))
         self.observation_dim = int(runtime_assets["observation_dim"])
         self.primitive_interval_ms = int(runtime_assets["primitive_interval_ms"])
         self._front_box = runtime_assets["front_box"]
@@ -465,6 +504,84 @@ class PPOPrimitivePathPlanner:
         self._guidance_points_signature = None
         self._action_mask_cached = None
         self._action_mask_calls_since_update = 0
+        self._action_mask_inflation_offsets = self._build_action_mask_inflation_offsets(self._action_mask_index)
+        self._last_action_mask_stats = {
+            "precomputed_available": self._action_mask_index is not None,
+            "precomputed_used": False,
+            "precomputed_candidate_count": None,
+            "precomputed_fallback_to_full": False,
+            "precomputed_index_kind": None
+            if self._action_mask_index is None
+            else str(getattr(self._action_mask_index, "index_kind", "unknown")),
+            "precomputed_index_source": self._action_mask_index_source,
+        }
+
+    def _build_action_mask_inflation_offsets(self, grid_index) -> List[Tuple[int, int]]:
+        if grid_index is None:
+            return []
+
+        resolution = max(float(getattr(grid_index, "grid_resolution", 0.0)), 1e-6)
+        radius = max(0.0, float(self.occupancy_inflation_radius))
+        radius_in_cells = int(math.ceil(radius / resolution))
+        offsets: List[Tuple[int, int]] = []
+        for dx in range(-radius_in_cells, radius_in_cells + 1):
+            for dy in range(-radius_in_cells, radius_in_cells + 1):
+                if (dx * dx + dy * dy) * (resolution * resolution) <= radius * radius + 1e-9:
+                    offsets.append((dx, dy))
+        return offsets
+
+    def _build_occupied_cells_from_lidar(self, lidar_norm: np.ndarray):
+        if self._action_mask_index is None:
+            return None
+
+        lidar_values = np.asarray(lidar_norm, dtype=np.float64).reshape(-1)
+        lidar_num = int(getattr(self.ppo_configs, "LIDAR_NUM", lidar_values.shape[0]))
+        lidar_range = float(getattr(self.ppo_configs, "LIDAR_RANGE", 30.0))
+        if lidar_values.shape[0] != lidar_num:
+            lidar_values = lidar_values[:lidar_num]
+
+        beam_angles = np.linspace(0.0, 2.0 * math.pi, lidar_num, endpoint=False)
+        distances = np.clip(lidar_values, 0.0, 1.0) * lidar_range
+        hit_mask = distances < (0.98 * lidar_range)
+        occupied_cells = set()
+
+        for beam_index in np.nonzero(hit_mask)[0]:
+            distance = float(distances[beam_index])
+            angle = float(beam_angles[beam_index])
+            cell = self._action_mask_index.world_to_cell(
+                distance * math.cos(angle),
+                distance * math.sin(angle),
+            )
+            if cell is None:
+                continue
+            cell_x, cell_y = cell
+            for offset_x, offset_y in self._action_mask_inflation_offsets:
+                occupied_cells.add((cell_x + offset_x, cell_y + offset_y))
+
+        return occupied_cells
+
+    def _get_action_mask_candidate_ids(
+        self,
+        observation: Optional[np.ndarray],
+        n_actions: int,
+    ) -> Optional[np.ndarray]:
+        if not self.mask_use_fast_prune or self._action_mask_index is None or observation is None:
+            return None
+
+        try:
+            lidar_num = int(getattr(self.ppo_configs, "LIDAR_NUM", 120))
+            observation_vec = np.asarray(observation, dtype=np.float64).reshape(-1)
+            lidar_obs = observation_vec[:lidar_num]
+            occupied_cells = self._build_occupied_cells_from_lidar(lidar_obs)
+            if occupied_cells is None:
+                return None
+            candidate_mask = self._action_mask_index.fast_prune_primitives(occupied_cells)
+            candidate_mask = np.asarray(candidate_mask, dtype=np.bool_).reshape(-1)
+            if candidate_mask.shape[0] != int(n_actions):
+                return None
+            return np.flatnonzero(candidate_mask).astype(np.int64)
+        except Exception:
+            return None
 
     @staticmethod
     def _build_primitive_metadata(primitive_library, library_path: str) -> Tuple[Dict[int, Dict[str, Any]], set]:
@@ -670,16 +787,64 @@ class PPOPrimitivePathPlanner:
         scene,
         participant,
         current_state: ArticulatedState,
+        observation: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if (
             self._action_mask_cached is not None
             and self._action_mask_calls_since_update < (self.action_mask_update_every_k - 1)
         ):
             self._action_mask_calls_since_update += 1
+            self._last_action_mask_stats = {
+                "precomputed_available": self._action_mask_index is not None,
+                "precomputed_used": False,
+                "precomputed_candidate_count": None,
+                "precomputed_fallback_to_full": False,
+                "precomputed_index_kind": None
+                if self._action_mask_index is None
+                else str(getattr(self._action_mask_index, "index_kind", "unknown")),
+                "precomputed_index_source": self._action_mask_index_source,
+            }
             return self._action_mask_cached.copy()
 
-        mask = np.zeros(int(self.primitive_library.size), dtype=np.int8)
-        for primitive_id in range(int(self.primitive_library.size)):
+        total_actions = int(self.primitive_library.size)
+        candidate_ids = None
+        precomputed_used = False
+        if self.action_mask_mode != "full":
+            candidate_ids = self._get_action_mask_candidate_ids(observation, total_actions)
+            precomputed_used = candidate_ids is not None
+
+        self._last_action_mask_stats = {
+            "precomputed_available": self._action_mask_index is not None,
+            "precomputed_used": precomputed_used,
+            "precomputed_candidate_count": None if candidate_ids is None else int(candidate_ids.shape[0]),
+            "precomputed_fallback_to_full": False,
+            "precomputed_index_kind": None
+            if self._action_mask_index is None
+            else str(getattr(self._action_mask_index, "index_kind", "unknown")),
+            "precomputed_index_source": self._action_mask_index_source,
+        }
+
+        if self.action_mask_mode == "fast_only":
+            if candidate_ids is None:
+                mask = np.ones(total_actions, dtype=np.int8)
+            else:
+                mask = np.zeros(total_actions, dtype=np.int8)
+                mask[candidate_ids] = 1
+            if not mask.any():
+                mask[:] = 1
+                self._last_action_mask_stats["precomputed_fallback_to_full"] = True
+            self._action_mask_cached = mask.copy()
+            self._action_mask_calls_since_update = 0
+            return mask
+
+        if candidate_ids is None:
+            mask = np.ones(total_actions, dtype=np.int8)
+            eval_ids = range(total_actions)
+        else:
+            mask = np.zeros(total_actions, dtype=np.int8)
+            eval_ids = candidate_ids
+
+        for primitive_id in eval_ids:
             primitive_actions = np.asarray(self.primitive_library.get_actions(int(primitive_id)), dtype=np.float64)
             rollout_states = self._rollout_primitive(participant, primitive_actions, state=current_state)
             if self._is_rollout_feasible(scene, rollout_states):
@@ -687,6 +852,8 @@ class PPOPrimitivePathPlanner:
 
         if not mask.any():
             mask[:] = 1
+            if candidate_ids is not None:
+                self._last_action_mask_stats["precomputed_fallback_to_full"] = True
 
         self._action_mask_cached = mask.copy()
         self._action_mask_calls_since_update = 0
@@ -699,7 +866,11 @@ class PPOPrimitivePathPlanner:
         current_state: ArticulatedState,
         observation: np.ndarray,
     ):
-        action_mask = self._compute_action_mask(scene, participant, current_state) if self.use_action_mask else None
+        action_mask = (
+            self._compute_action_mask(scene, participant, current_state, observation=observation)
+            if self.use_action_mask
+            else None
+        )
         primitive_id, _ = self.agent.choose_action(
             observation,
             deterministic=self.deterministic,
@@ -911,6 +1082,24 @@ class PPOPrimitivePathPlanner:
         metadata["action_mask_mode"] = self.action_mask_mode
         metadata["action_mask_update_every_k"] = int(self.action_mask_update_every_k)
         metadata["action_mask_feasible_count"] = None if action_mask is None else int(np.count_nonzero(action_mask))
+        metadata["action_mask_precomputed_available"] = bool(
+            self._last_action_mask_stats.get("precomputed_available", False)
+        )
+        metadata["action_mask_precomputed_used"] = bool(
+            self._last_action_mask_stats.get("precomputed_used", False)
+        )
+        metadata["action_mask_precomputed_candidate_count"] = self._last_action_mask_stats.get(
+            "precomputed_candidate_count"
+        )
+        metadata["action_mask_precomputed_fallback_to_full"] = bool(
+            self._last_action_mask_stats.get("precomputed_fallback_to_full", False)
+        )
+        metadata["action_mask_precomputed_index_kind"] = self._last_action_mask_stats.get(
+            "precomputed_index_kind"
+        )
+        metadata["action_mask_precomputed_index_source"] = self._last_action_mask_stats.get(
+            "precomputed_index_source"
+        )
         metadata["replan_every_steps"] = int(self.replan_every_steps)
         control_actions = self._expand_primitive_controls(primitive_actions)
         metadata["control_actions_shape"] = tuple(int(dim) for dim in control_actions.shape)

@@ -66,6 +66,13 @@ def test_ppo_primitive_planner_builds_reference():
     assert result.metadata["planning_mode"] == "closed_loop_policy"
     assert result.metadata["action_mask_used"] is True
     assert result.metadata["action_mask_feasible_count"] > 0
+    assert result.metadata["action_mask_precomputed_available"] is True
+    assert result.metadata["action_mask_precomputed_used"] is True
+    assert result.metadata["action_mask_precomputed_candidate_count"] is not None
+    if result.metadata["action_mask_precomputed_candidate_count"] == 0:
+        assert result.metadata["action_mask_precomputed_fallback_to_full"] is True
+    assert result.metadata["action_mask_precomputed_index_kind"] in {"swept_cells", "approx_centerline", "unknown"}
+    assert result.metadata["action_mask_precomputed_index_source"] in {"library", "approx"}
     assert result.metadata["plan_runtime_ms"] >= 0.0
     assert len(result.metadata["primitive_sequence"]) == 1
     assert result.metadata["control_actions_shape"] == result.control_actions.shape
@@ -162,6 +169,9 @@ def test_simulation_runner_consumes_ppo_reference():
     assert runner.last_planning_result.metadata["planning_mode"] == "closed_loop_policy"
     assert runner.last_planning_result.metadata["action_mask_used"] is True
     assert runner.last_planning_result.metadata["action_mask_feasible_count"] > 0
+    assert runner.last_planning_result.metadata["action_mask_precomputed_available"] is True
+    assert runner.last_planning_result.metadata["action_mask_precomputed_used"] is True
+    assert runner.last_planning_result.metadata["action_mask_precomputed_candidate_count"] is not None
     assert runner.last_planning_result.metadata["primitive_selected_count"] >= 1
     assert runner.last_planning_result.metadata["adaptive_selected_count_total"] == sum(
         runner.last_planning_result.metadata["adaptive_primitive_selection_counts"].values()
@@ -244,6 +254,39 @@ def test_simulation_runner_reuses_planner_runtime_assets(monkeypatch):
     assert runner1.last_planning_result is not None
     assert runner2.last_planning_result is not None
     assert runner2.scene.metadata["reference_path_source"] == "ppo_primitive_global_plan"
+
+
+@pytest.mark.render
+def test_ppo_primitive_planner_calls_precomputed_action_mask_pruner(monkeypatch):
+    checkpoint_path, ppo_root = _ppo_assets()
+    scene, participant = _build_navigation_scene()
+
+    planner = PPOPrimitivePathPlanner(
+        checkpoint_path=str(checkpoint_path),
+        ppo_root=str(ppo_root),
+        control_interval_ms=100,
+        replan_every_steps=1,
+        deterministic=True,
+    )
+    if planner._action_mask_index is None:
+        pytest.skip("Precomputed action-mask index is unavailable for the matched primitive library.")
+
+    call_count = 0
+    original_fast_prune = planner._action_mask_index.fast_prune_primitives
+
+    def _counted_fast_prune(occupied_cells):
+        nonlocal call_count
+        call_count += 1
+        return original_fast_prune(occupied_cells)
+
+    monkeypatch.setattr(planner._action_mask_index, "fast_prune_primitives", _counted_fast_prune)
+    result = planner.plan(scene, participant)
+
+    assert call_count >= 1
+    assert result.metadata["action_mask_precomputed_used"] is True
+    assert result.metadata["action_mask_precomputed_candidate_count"] is not None
+    if result.metadata["action_mask_precomputed_candidate_count"] == 0:
+        assert result.metadata["action_mask_precomputed_fallback_to_full"] is True
 
 
 @pytest.mark.render
