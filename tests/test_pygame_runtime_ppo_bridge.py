@@ -224,7 +224,7 @@ def test_directional_guard_ignores_side_obstacle():
     assert stop_stats["stop_lidar_distance_m"] == pytest.approx(10.0)
 
 
-def test_prefix_safe_primitive_truncates_without_emergency():
+def test_policy_selected_primitive_keeps_full_horizon_without_post_decision_truncation():
     scene, participant = _build_navigation_scene()
     actions = np.array(
         [
@@ -258,16 +258,19 @@ def test_prefix_safe_primitive_truncates_without_emergency():
     )
 
     assert primitive_id == 0
-    assert primitive_actions.shape == (2, 2)
-    assert selection_info["safe_prefix_primitive_steps"] == 2
-    assert selection_info["control_prefix_steps"] == 4
-    assert selection_info["prefix_truncated"] is True
-    assert selection_info["guard_mode"] == "safe_prefix"
+    assert primitive_actions.shape == (3, 2)
+    assert selection_info["safe_prefix_primitive_steps"] is None
+    assert selection_info["control_prefix_steps"] == 6
+    assert selection_info["prefix_truncated"] is False
+    assert selection_info["guard_mode"] == "directional_stop_guard"
+    assert planner._last_guard_stats["guard_selected_primitive_id"] == 0
+    assert planner._last_guard_stats["guard_final_primitive_id"] == 0
+    assert planner._last_guard_stats["guard_fallback_used"] is False
     assert planner._last_guard_stats["guard_emergency_used"] is False
-    assert len(rollout_states) == 5
+    assert len(rollout_states) == 7
 
 
-def test_prefix_safe_primitive_falls_back_to_next_candidate_when_top_prefix_zero():
+def test_policy_selected_primitive_is_not_replaced_by_soft_prefix_fallback():
     scene, participant = _build_navigation_scene()
     actions = np.array(
         [
@@ -300,12 +303,16 @@ def test_prefix_safe_primitive_falls_back_to_next_candidate_when_top_prefix_zero
         observation,
     )
 
-    assert primitive_id == 1
-    assert primitive_actions.shape == (2, 2)
-    assert selection_info["safe_prefix_primitive_steps"] == 2
-    assert planner._last_guard_stats["guard_fallback_used"] is True
+    assert primitive_id == 0
+    assert primitive_actions.shape == (3, 2)
+    assert selection_info["safe_prefix_primitive_steps"] is None
+    assert selection_info["control_prefix_steps"] == 6
+    assert selection_info["guard_mode"] == "directional_stop_guard"
+    assert planner._last_guard_stats["guard_selected_primitive_id"] == 0
+    assert planner._last_guard_stats["guard_final_primitive_id"] == 0
+    assert planner._last_guard_stats["guard_fallback_used"] is False
     assert planner._last_guard_stats["guard_emergency_used"] is False
-    assert len(rollout_states) == 5
+    assert len(rollout_states) == 7
 
 
 @pytest.mark.render

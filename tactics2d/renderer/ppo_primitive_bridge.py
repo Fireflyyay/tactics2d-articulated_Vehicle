@@ -1037,7 +1037,7 @@ class PPOPrimitivePathPlanner:
         stats["soft_mask_min"] = float(np.min(mask)) if mask.size else 0.0
         stats["soft_mask_max"] = float(np.max(mask)) if mask.size else 0.0
         stats["soft_mask_mean"] = float(np.mean(mask)) if mask.size else 0.0
-        stats["soft_effective_action_count"] = int(np.count_nonzero(mask > (float(np.min(mask)) + 1e-6)))
+        stats["soft_effective_action_count"] = int(np.count_nonzero(mask > 0.0))
         if self._last_safe_prefix_steps is not None:
             stats["safe_prefix_step_len_mean"] = float(np.mean(self._last_safe_prefix_steps))
             stats["safe_prefix_step_len_min"] = float(np.min(self._last_safe_prefix_steps))
@@ -1510,221 +1510,20 @@ class PPOPrimitivePathPlanner:
             if self.use_action_mask
             else None
         )
-        prefix_mode = self.action_mask_mode == "soft_ray" and self._ray_safety_index is not None
-        if prefix_mode:
-            ranked_candidates = self._ranked_primitive_candidates(observation, action_mask=action_mask)
-            safe_prefix_steps = self._last_safe_prefix_steps
-            if safe_prefix_steps is None:
-                safe_prefix_steps = np.zeros((int(self.primitive_library.size),), dtype=np.int32)
-
-            repeat_count = self._control_repeat_count()
-            total_control_horizon = int(self.primitive_library.horizon) * repeat_count
-            terminal_mode = self._terminal_context_active(
-                scene,
-                current_state,
-                positive_count=int(np.count_nonzero(safe_prefix_steps > 0)),
+        if hasattr(self.agent, "choose_action"):
+            primitive_id, _ = self.agent.choose_action(
+                observation,
+                deterministic=self.deterministic,
+                action_mask=action_mask,
             )
-            selected_primitive_id = int(ranked_candidates[0]["primitive_id"]) if ranked_candidates else -1
-            selected_safe_prefix_steps = (
-                int(safe_prefix_steps[selected_primitive_id]) if 0 <= selected_primitive_id < safe_prefix_steps.shape[0] else 0
+            primitive_id = int(primitive_id)
+        else:
+            ranked_ids = self._ranked_primitive_ids(observation, action_mask=action_mask)
+            primitive_id = (
+                int(ranked_ids[0])
+                if ranked_ids.size > 0
+                else int(self._choose_emergency_primitive_id())
             )
-
-            if self._is_precisely_parked(scene, current_state, require_stop_speed=False):
-                emergency_id = self._choose_emergency_primitive_id()
-                control_prefix_steps = repeat_count
-                zero_actions = np.zeros((1, 2), dtype=np.float64)
-                self._last_safety_stop_stats = {
-                    "stop_triggered": False,
-                    "stop_reason": "parked_latch",
-                    "stop_replan_requested": False,
-                }
-                self._last_guard_stats = {
-                    "guard_enabled": True,
-                    "guard_attempts": int(min(len(ranked_candidates), self.max_guard_candidates)),
-                    "guard_selected_failed": False,
-                    "guard_fallback_used": bool(selected_primitive_id != int(emergency_id) and selected_primitive_id >= 0),
-                    "guard_emergency_used": True,
-                    "guard_selected_primitive_id": int(selected_primitive_id),
-                    "guard_final_primitive_id": int(emergency_id),
-                    "guard_selected_safe_prefix_steps": int(selected_safe_prefix_steps),
-                    "guard_final_safe_prefix_steps": 0,
-                    "guard_control_prefix_steps": int(control_prefix_steps),
-                    "guard_prefix_truncated": True,
-                    "guard_terminal_mode": bool(terminal_mode),
-                    "guard_mode": "parked_latch",
-                }
-                selection_info = {
-                    "primitive_prefix_steps": 1,
-                    "control_prefix_steps": int(control_prefix_steps),
-                    "prefix_truncated": True,
-                    "replan_when_controls_exhausted": False,
-                    "terminal_mode_active": bool(terminal_mode),
-                    "parked_latch_active": True,
-                    "safe_prefix_primitive_steps": 0,
-                    "safe_prefix_control_steps": 0,
-                    "guard_mode": "parked_latch",
-                }
-                return (
-                    int(emergency_id),
-                    zero_actions,
-                    self._stationary_prefix_rollout(current_state, control_prefix_steps),
-                    action_mask,
-                    selection_info,
-                )
-
-            chosen: Optional[Dict[str, Any]] = None
-            if terminal_mode:
-                best_terminal = None
-                for candidate in ranked_candidates[: int(self.max_guard_candidates)]:
-                    primitive_id = int(candidate["primitive_id"])
-                    safe_steps = int(safe_prefix_steps[primitive_id])
-                    safe_control_steps = safe_steps * repeat_count
-                    if safe_control_steps <= 0:
-                        continue
-                    for control_prefix_steps in range(1, safe_control_steps + 1):
-                        prefix_state = self._cached_prefix_state(
-                            participant,
-                            current_state,
-                            primitive_id,
-                            control_prefix_steps,
-                        )
-                        metrics = self._terminal_state_metrics(scene, prefix_state)
-                        terminal_key = self._terminal_candidate_key(metrics, control_prefix_steps) + (
-                            -float(candidate["probability"]),
-                        )
-                        candidate_entry = {
-                            "primitive_id": primitive_id,
-                            "primitive_prefix_steps": int(math.ceil(control_prefix_steps / repeat_count)),
-                            "control_prefix_steps": int(control_prefix_steps),
-                            "safe_prefix_primitive_steps": int(safe_steps),
-                            "safe_prefix_control_steps": int(safe_control_steps),
-                            "metrics": metrics,
-                            "probability": float(candidate["probability"]),
-                            "key": terminal_key,
-                        }
-                        if best_terminal is None or candidate_entry["key"] < best_terminal["key"]:
-                            best_terminal = candidate_entry
-                chosen = best_terminal
-            else:
-                for candidate in ranked_candidates[: int(self.max_guard_candidates)]:
-                    primitive_id = int(candidate["primitive_id"])
-                    safe_steps = int(safe_prefix_steps[primitive_id])
-                    safe_control_steps = safe_steps * repeat_count
-                    if safe_control_steps <= 0:
-                        continue
-                    chosen = {
-                        "primitive_id": primitive_id,
-                        "primitive_prefix_steps": int(safe_steps),
-                        "control_prefix_steps": int(safe_control_steps),
-                        "safe_prefix_primitive_steps": int(safe_steps),
-                        "safe_prefix_control_steps": int(safe_control_steps),
-                        "metrics": self._terminal_state_metrics(
-                            scene,
-                            self._cached_prefix_state(
-                                participant,
-                                current_state,
-                                primitive_id,
-                                safe_control_steps,
-                            ),
-                        ),
-                        "probability": float(candidate["probability"]),
-                    }
-                    break
-
-            if chosen is None:
-                emergency_id = self._choose_emergency_primitive_id()
-                control_prefix_steps = repeat_count
-                zero_actions = np.zeros((1, 2), dtype=np.float64)
-                self._last_safety_stop_stats = {
-                    "stop_triggered": True,
-                    "stop_reason": "zero_safe_prefix",
-                    "stop_replan_requested": bool(self.replan_on_emergency_stop),
-                }
-                self._last_guard_stats = {
-                    "guard_enabled": True,
-                    "guard_attempts": int(min(len(ranked_candidates), self.max_guard_candidates)),
-                    "guard_selected_failed": True,
-                    "guard_fallback_used": False,
-                    "guard_emergency_used": True,
-                    "guard_selected_primitive_id": int(selected_primitive_id),
-                    "guard_final_primitive_id": int(emergency_id),
-                    "guard_selected_safe_prefix_steps": int(selected_safe_prefix_steps),
-                    "guard_final_safe_prefix_steps": 0,
-                    "guard_control_prefix_steps": int(control_prefix_steps),
-                    "guard_prefix_truncated": True,
-                    "guard_terminal_mode": bool(terminal_mode),
-                    "guard_mode": "zero_safe_prefix",
-                }
-                selection_info = {
-                    "primitive_prefix_steps": 1,
-                    "control_prefix_steps": int(control_prefix_steps),
-                    "prefix_truncated": True,
-                    "replan_when_controls_exhausted": False,
-                    "terminal_mode_active": bool(terminal_mode),
-                    "parked_latch_active": False,
-                    "safe_prefix_primitive_steps": 0,
-                    "safe_prefix_control_steps": 0,
-                    "guard_mode": "zero_safe_prefix",
-                }
-                return (
-                    int(emergency_id),
-                    zero_actions,
-                    self._stationary_prefix_rollout(current_state, control_prefix_steps),
-                    action_mask,
-                    selection_info,
-                )
-
-            primitive_id = int(chosen["primitive_id"])
-            primitive_actions_full = np.asarray(self.primitive_library.get_actions(primitive_id), dtype=np.float64)
-            primitive_prefix_steps = max(int(chosen["primitive_prefix_steps"]), 1)
-            control_prefix_steps = max(int(chosen["control_prefix_steps"]), 1)
-            primitive_actions = primitive_actions_full[:primitive_prefix_steps].copy()
-            rollout_states = self._cached_prefix_rollout(
-                participant,
-                current_state,
-                primitive_id,
-                control_prefix_steps,
-            )
-            prefix_truncated = bool(control_prefix_steps < total_control_horizon)
-            self._last_safety_stop_stats = {
-                "stop_triggered": False,
-                "stop_reason": None,
-                "stop_replan_requested": False,
-            }
-            self._last_guard_stats = {
-                "guard_enabled": True,
-                "guard_attempts": int(min(len(ranked_candidates), self.max_guard_candidates)),
-                "guard_selected_failed": bool(selected_safe_prefix_steps * repeat_count < total_control_horizon),
-                "guard_fallback_used": bool(primitive_id != selected_primitive_id),
-                "guard_emergency_used": False,
-                "guard_selected_primitive_id": int(selected_primitive_id),
-                "guard_final_primitive_id": int(primitive_id),
-                "guard_selected_safe_prefix_steps": int(selected_safe_prefix_steps),
-                "guard_final_safe_prefix_steps": int(chosen["safe_prefix_primitive_steps"]),
-                "guard_control_prefix_steps": int(control_prefix_steps),
-                "guard_prefix_truncated": bool(prefix_truncated),
-                "guard_terminal_mode": bool(terminal_mode),
-                "guard_mode": "terminal_prefix" if terminal_mode else "safe_prefix",
-            }
-            selection_info = {
-                "primitive_prefix_steps": int(primitive_prefix_steps),
-                "control_prefix_steps": int(control_prefix_steps),
-                "prefix_truncated": bool(prefix_truncated),
-                "replan_when_controls_exhausted": bool(prefix_truncated),
-                "terminal_mode_active": bool(terminal_mode),
-                "parked_latch_active": False,
-                "safe_prefix_primitive_steps": int(chosen["safe_prefix_primitive_steps"]),
-                "safe_prefix_control_steps": int(chosen["safe_prefix_control_steps"]),
-                "guard_mode": "terminal_prefix" if terminal_mode else "safe_prefix",
-            }
-            return primitive_id, primitive_actions, rollout_states, action_mask, selection_info
-
-        primitive_id, _ = self.agent.choose_action(
-            observation,
-            deterministic=self.deterministic,
-            action_mask=action_mask,
-        )
-        primitive_id = int(primitive_id)
         primitive_actions = np.asarray(self.primitive_library.get_actions(primitive_id), dtype=np.float64)
         stop_stats = self._evaluate_directional_stop(scene, current_state, observation, primitive_actions, store=True)
         full_control_steps = int(primitive_actions.shape[0]) * self._control_repeat_count()
