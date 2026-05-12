@@ -5,7 +5,6 @@ import os
 import sys
 import time
 import warnings
-from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, Polygon
 
 from tactics2d.controller import ArticulatedReferenceTrajectory
 from tactics2d.map.generator.generate_ppo_parking_map import _discover_ppo_root
@@ -30,22 +29,6 @@ from tactics2d.utils.ppo_articulated_defaults import (
 
 
 _PPO_IMPORT_CACHE: Dict[str, Dict[str, Any]] = {}
-
-
-def _load_primitive_sidecar_meta(npz_path: str) -> List[Dict[str, Any]]:
-    sidecar_path = Path(npz_path).with_name(f"{Path(npz_path).stem}_meta.json")
-    if not sidecar_path.exists():
-        return []
-
-    try:
-        with sidecar_path.open("r", encoding="utf-8") as file_obj:
-            payload = json.load(file_obj)
-    except Exception:
-        return []
-
-    if not isinstance(payload, list):
-        return []
-    return [item for item in payload if isinstance(item, dict)]
 
 
 def _load_checkpoint(path: str, map_location: str = "cpu"):
@@ -223,6 +206,7 @@ def _load_ppo_modules(ppo_root: Optional[str]) -> Dict[str, Any]:
             "lidar": importlib.import_module("env.lidar_simulator"),
             "primitives": importlib.import_module("primitives.library"),
             "primitive_index": importlib.import_module("primitives.primitive_index"),
+            "primitive_ray_safety": importlib.import_module("primitives.primitive_ray_safety"),
         }
     finally:
         if original_sdl_video_driver is None:
@@ -264,6 +248,10 @@ def _dedupe_rollout_points(states: Sequence[ArticulatedState]) -> List[Tuple[flo
     return points
 
 
+def _wrap_pi(angle: float) -> float:
+    return float((float(angle) + math.pi) % (2.0 * math.pi) - math.pi)
+
+
 @dataclass
 class PPOPlanningResult:
     primitive_id: int
@@ -275,8 +263,6 @@ class PPOPlanningResult:
 
 
 class PPOPrimitivePathPlanner:
-    _RUNTIME_ASSET_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
-
     def __init__(
         self,
         checkpoint_path: str,
@@ -284,6 +270,10 @@ class PPOPrimitivePathPlanner:
         control_interval_ms: int = 100,
         replan_every_steps: int = 1,
         deterministic: bool = True,
+        safety_stop_distance_m: Optional[float] = None,
+        safety_forward_sector_half_angle_deg: Optional[float] = None,
+        safety_collision_buffer_m: Optional[float] = None,
+        replan_on_emergency_stop: Optional[bool] = None,
     ):
         self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
         if not Path(self.checkpoint_path).exists():
@@ -312,6 +302,95 @@ class PPOPrimitivePathPlanner:
         self.occupancy_inflation_radius = float(
             getattr(self.modules["configs"], "OCCUPANCY_INFLATION_RADIUS", 1.8)
         )
+        self.soft_mask_gamma = float(getattr(self.modules["configs"], "SOFT_MASK_GAMMA", 1.5))
+        self.soft_mask_eps = float(getattr(self.modules["configs"], "SOFT_MASK_EPS", 0.01))
+        self.soft_mask_terminal_gamma = float(
+            getattr(self.modules["configs"], "SOFT_MASK_TERMINAL_GAMMA", 0.5)
+        )
+        self.soft_mask_terminal_eps = float(getattr(self.modules["configs"], "SOFT_MASK_TERMINAL_EPS", 0.05))
+        self.soft_mask_terminal_radius = float(
+            getattr(self.modules["configs"], "SOFT_MASK_TERMINAL_RADIUS", 4.0)
+        )
+        self.soft_mask_min_action_count = int(getattr(self.modules["configs"], "SOFT_MASK_MIN_ACTION_COUNT", 6))
+        self.soft_mask_terminal_heading_scale = float(
+            getattr(self.modules["configs"], "SOFT_MASK_TERMINAL_HEADING_SCALE", math.radians(35.0))
+        )
+        self.soft_mask_terminal_articulation_scale = float(
+            getattr(self.modules["configs"], "SOFT_MASK_TERMINAL_ARTICULATION_SCALE", math.radians(35.0))
+        )
+        self.soft_mask_terminal_weight_min = float(
+            getattr(self.modules["configs"], "SOFT_MASK_TERMINAL_WEIGHT_MIN", 0.60)
+        )
+        self.soft_mask_terminal_weight_max = float(
+            getattr(self.modules["configs"], "SOFT_MASK_TERMINAL_WEIGHT_MAX", 1.25)
+        )
+        self.safety_stop_distance_m = float(
+            getattr(self.modules["configs"], "SAFETY_STOP_DISTANCE_M", 0.5)
+            if safety_stop_distance_m is None
+            else safety_stop_distance_m
+        )
+        self.safety_forward_sector_half_angle = math.radians(
+            float(
+                getattr(self.modules["configs"], "SAFETY_FORWARD_SECTOR_HALF_ANGLE_DEG", 18.0)
+                if safety_forward_sector_half_angle_deg is None
+                else safety_forward_sector_half_angle_deg
+            )
+        )
+        self.safety_forward_sector_max_half_angle = math.radians(
+            float(getattr(self.modules["configs"], "SAFETY_FORWARD_SECTOR_MAX_HALF_ANGLE_DEG", 55.0))
+        )
+        self.safety_steering_sector_center_gain = float(
+            getattr(self.modules["configs"], "SAFETY_STEERING_SECTOR_CENTER_GAIN", 0.5)
+        )
+        self.safety_steering_sector_half_angle_gain = float(
+            getattr(self.modules["configs"], "SAFETY_STEERING_SECTOR_HALF_ANGLE_GAIN", 1.0)
+        )
+        self.safety_collision_buffer_m = float(
+            getattr(self.modules["configs"], "SAFETY_COLLISION_BUFFER_M", 0.25)
+            if safety_collision_buffer_m is None
+            else safety_collision_buffer_m
+        )
+        self.replan_on_emergency_stop = bool(
+            getattr(self.modules["configs"], "REPLAN_ON_EMERGENCY_STOP", True)
+            if replan_on_emergency_stop is None
+            else replan_on_emergency_stop
+        )
+        self.max_guard_candidates = max(
+            1,
+            int(getattr(self.modules["configs"], "SOFT_MASK_MAX_GUARD_CANDIDATES", 3)),
+        )
+        self.emergency_primitive_id = getattr(self.modules["configs"], "SOFT_MASK_EMERGENCY_PRIMITIVE_ID", None)
+        self._ray_safety_index = None
+        self._safe_prefix_steps_cached: Optional[np.ndarray] = None
+        self._last_safe_prefix_steps: Optional[np.ndarray] = None
+        self._control_prefix_state_cache: Optional[np.ndarray] = None
+        self._control_prefix_cache_repeat_count = 0
+        self._control_prefix_cache_control_steps = 0
+        self.terminal_heading_tolerance_deg = float(
+            getattr(self.modules["configs"], "PRIMITIVE_REFINEMENT_FINAL_HEADING_TOL_DEG", 5.0)
+        )
+        self.terminal_overlap_target = float(
+            getattr(self.modules["configs"], "PRIMITIVE_REFINEMENT_FINAL_OVERLAP_TARGET", 0.75)
+        )
+        self.terminal_front_overlap_target = float(
+            getattr(self.modules["configs"], "PRIMITIVE_REFINEMENT_FRONT_TERMINAL_OK_OVERLAP_TARGET", 0.80)
+        )
+        self.terminal_rear_overlap_min = float(
+            getattr(
+                self.modules["configs"],
+                "PRIMITIVE_REFINEMENT_FRONT_BODY_FIRST_TERMINAL_POLISH_REAR_OVERLAP_MIN",
+                0.45,
+            )
+        )
+        self.parked_stop_speed_mps = float(
+            getattr(self.modules["configs"], "TERMINAL_PARKED_STOP_SPEED_MPS", 0.20)
+        )
+        self._last_guard_stats: Dict[str, Any] = {}
+        self._last_safety_stop_stats: Dict[str, Any] = {
+            "stop_triggered": False,
+            "stop_reason": None,
+            "stop_replan_requested": False,
+        }
         self._action_mask_cached: Optional[np.ndarray] = None
         self._action_mask_calls_since_update = 0
         self._action_mask_index = None
@@ -324,25 +403,26 @@ class PPOPrimitivePathPlanner:
             "precomputed_fallback_to_full": False,
             "precomputed_index_kind": None,
             "precomputed_index_source": "none",
+            "ray_safety_available": False,
+            "soft_mask_ms": None,
+            "soft_effective_action_count": None,
         }
-        self._primitive_selection_counts: Counter = Counter()
-        self._adaptive_primitive_selection_counts: Counter = Counter()
-        self._adaptive_round_selection_counts: Counter = Counter()
-        self._primitive_meta_by_id: Dict[int, Dict[str, Any]] = {}
-        self._adaptive_primitive_ids = set()
-        self.runtime_asset_cache_hit = False
 
         self.ppo_configs = self.modules["configs"]
         self._load_runtime_assets()
 
-    @classmethod
-    def clear_runtime_asset_cache(cls) -> None:
-        cls._RUNTIME_ASSET_CACHE.clear()
+    @staticmethod
+    def _normalize_action_mask_mode(mode: object) -> str:
+        normalized = str(mode).strip().lower()
+        if normalized == "hyrbid":
+            normalized = "hybrid"
+        if normalized in {"soft", "ray_soft"}:
+            normalized = "soft_ray"
+        if normalized not in {"fast_only", "hybrid", "full", "soft_ray"}:
+            normalized = "hybrid"
+        return normalized
 
-    def _runtime_asset_cache_key(self) -> Tuple[str, str]:
-        return (self.checkpoint_path, self.ppo_root)
-
-    def _build_runtime_assets(self) -> Dict[str, Any]:
+    def _load_runtime_assets(self):
         checkpoint = _load_checkpoint(self.checkpoint_path, map_location="cpu")
         checkpoint_configs = _extract_checkpoint_configs(checkpoint)
         actor_output_size = _infer_actor_output_size(checkpoint)
@@ -385,7 +465,7 @@ class PPOPrimitivePathPlanner:
                 action_mask_index = self.modules["primitive_index"].build_approx_index_from_deltas(
                     actions=np.asarray(getattr(primitive_library, "actions"), dtype=np.float64),
                     deltas=np.asarray(getattr(primitive_library, "deltas"), dtype=np.float64),
-                    grid_resolution=float(getattr(self.ppo_configs, "GRID_RESOLUTION", 0.3)),
+                    grid_resolution=float(getattr(self.ppo_configs, "GRID_RESOLUTION", 0.6)),
                     x_min=-6.0,
                     x_max=12.0,
                     y_min=-9.0,
@@ -425,85 +505,21 @@ class PPOPrimitivePathPlanner:
             "actor_layers": actor_layers,
             "critic_layers": critic_layers,
             "gamma": float(checkpoint_configs.get("gamma", self.ppo_configs.GAMMA_BASE ** primitive_library.horizon)),
+            "soft_mask_logit_lambda": float(getattr(self.ppo_configs, "SOFT_MASK_LOGIT_LAMBDA", 1.0)),
+            "soft_mask_small_value": float(getattr(self.ppo_configs, "SOFT_MASK_SMALL_VALUE", 1e-8)),
         }
 
         ppo_agent_cls = self.modules["ppo_agent"].PPOAgent
-        self.modules["lidar"].LidarSimlator
+        lidar_cls = self.modules["lidar"].LidarSimlator
         guidance_cls = self.modules["guidance"].SoftGlobalGuidance
 
-        agent = ppo_agent_cls(agent_configs, discrete=True, load_params=True)
-        _restore_agent_for_inference(agent, checkpoint)
-
-        primitive_library_path = str(Path(library_path).resolve())
-        primitive_meta_by_id, adaptive_primitive_ids = self._build_primitive_metadata(
-            primitive_library,
-            primitive_library_path,
-        )
-        front_box = build_front_vehicle_box(
-            width=PPO_WIDTH,
-            hitch_offset=PPO_HITCH_OFFSET,
-            front_overhang=PPO_FRONT_OVERHANG,
-        )
-        rear_box = build_rear_vehicle_box(
-            width=PPO_WIDTH,
-            trailer_length=PPO_TRAILER_LENGTH,
-            rear_overhang=PPO_REAR_OVERHANG,
-        )
-        guidance_kwargs = None
-        if bool(getattr(self.ppo_configs, "ENABLE_GLOBAL_SOFT_GUIDANCE", False)):
-            guidance_kwargs = {
-                "grid_resolution": float(self.ppo_configs.GUIDANCE_GRID_RESOLUTION),
-                "obstacle_inflation": float(self.ppo_configs.GUIDANCE_OBS_INFLATION),
-                "map_margin": float(self.ppo_configs.GUIDANCE_MAP_MARGIN),
-                "lookahead_base": float(self.ppo_configs.GUIDANCE_LOOKAHEAD_BASE),
-                "lookahead_speed_gain": float(self.ppo_configs.GUIDANCE_LOOKAHEAD_SPEED_GAIN),
-                "lookahead_min": float(self.ppo_configs.GUIDANCE_LOOKAHEAD_MIN),
-                "lookahead_max": float(self.ppo_configs.GUIDANCE_LOOKAHEAD_MAX),
-                "progress_search_window": int(self.ppo_configs.GUIDANCE_PROGRESS_WINDOW),
-                "min_clearance_m": float(self.ppo_configs.GUIDANCE_MIN_CLEARANCE_M),
-                "full_clearance_m": float(self.ppo_configs.GUIDANCE_FULL_CLEARANCE_M),
-                "near_obs_dist_m": float(self.ppo_configs.GUIDANCE_NEAR_OBS_DIST_M),
-                "max_dense_ratio": float(self.ppo_configs.GUIDANCE_MAX_DENSE_RATIO),
-            }
-
-        return {
-            "agent": agent,
-            "primitive_library": primitive_library,
-            "primitive_library_path": primitive_library_path,
-            "action_mask_index": action_mask_index,
-            "action_mask_index_source": action_mask_index_source,
-            "observation_dim": int(observation_shape[0]),
-            "primitive_interval_ms": primitive_interval_ms,
-            "front_box": front_box,
-            "rear_box": rear_box,
-            "primitive_meta_by_id": primitive_meta_by_id,
-            "adaptive_primitive_ids": adaptive_primitive_ids,
-            "guidance_cls": guidance_cls,
-            "guidance_kwargs": guidance_kwargs,
-        }
-
-    def _apply_runtime_assets(self, runtime_assets: Dict[str, Any]) -> None:
-        self.agent = deepcopy(runtime_assets["agent"])
-        self.primitive_library = runtime_assets["primitive_library"]
-        self.primitive_library_path = runtime_assets["primitive_library_path"]
-        self._action_mask_index = runtime_assets.get("action_mask_index")
-        self._action_mask_index_source = str(runtime_assets.get("action_mask_index_source", "none"))
-        self.observation_dim = int(runtime_assets["observation_dim"])
-        self.primitive_interval_ms = int(runtime_assets["primitive_interval_ms"])
-        self._front_box = runtime_assets["front_box"]
-        self._rear_box = runtime_assets["rear_box"]
-        self._primitive_meta_by_id = deepcopy(runtime_assets["primitive_meta_by_id"])
-        self._adaptive_primitive_ids = set(runtime_assets["adaptive_primitive_ids"])
-        lidar_cls = self.modules["lidar"].LidarSimlator
-        self.lidar = lidar_cls(float(self.ppo_configs.LIDAR_RANGE), int(self.ppo_configs.LIDAR_NUM))
-        self.global_guidance = None
-        guidance_kwargs = runtime_assets.get("guidance_kwargs")
-        guidance_cls = runtime_assets.get("guidance_cls")
-        if guidance_cls is not None and guidance_kwargs is not None:
-            self.global_guidance = guidance_cls(**guidance_kwargs)
-        self._guidance_points_signature = None
-        self._action_mask_cached = None
-        self._action_mask_calls_since_update = 0
+        self.agent = ppo_agent_cls(agent_configs, discrete=True, load_params=True)
+        _restore_agent_for_inference(self.agent, checkpoint)
+        self.primitive_library = primitive_library
+        self.primitive_library_path = str(Path(library_path).resolve())
+        self._action_mask_index = action_mask_index
+        self._action_mask_index_source = action_mask_index_source
+        self._ray_safety_index = getattr(primitive_library, "ray_safety_index", None)
         self._action_mask_inflation_offsets = self._build_action_mask_inflation_offsets(self._action_mask_index)
         self._last_action_mask_stats = {
             "precomputed_available": self._action_mask_index is not None,
@@ -514,7 +530,39 @@ class PPOPrimitivePathPlanner:
             if self._action_mask_index is None
             else str(getattr(self._action_mask_index, "index_kind", "unknown")),
             "precomputed_index_source": self._action_mask_index_source,
+            "ray_safety_available": self._ray_safety_index is not None,
+            "soft_mask_ms": None,
+            "soft_effective_action_count": None,
         }
+        self.observation_dim = int(observation_shape[0])
+        self.primitive_interval_ms = primitive_interval_ms
+        self.lidar = lidar_cls(float(self.ppo_configs.LIDAR_RANGE), int(self.ppo_configs.LIDAR_NUM))
+        self._front_box = build_front_vehicle_box(
+            width=PPO_WIDTH,
+            hitch_offset=PPO_HITCH_OFFSET,
+            front_overhang=PPO_FRONT_OVERHANG,
+        )
+        self._rear_box = build_rear_vehicle_box(
+            width=PPO_WIDTH,
+            trailer_length=PPO_TRAILER_LENGTH,
+            rear_overhang=PPO_REAR_OVERHANG,
+        )
+        self.global_guidance = None
+        if bool(getattr(self.ppo_configs, "ENABLE_GLOBAL_SOFT_GUIDANCE", False)):
+            self.global_guidance = guidance_cls(
+                grid_resolution=float(self.ppo_configs.GUIDANCE_GRID_RESOLUTION),
+                obstacle_inflation=float(self.ppo_configs.GUIDANCE_OBS_INFLATION),
+                map_margin=float(self.ppo_configs.GUIDANCE_MAP_MARGIN),
+                lookahead_base=float(self.ppo_configs.GUIDANCE_LOOKAHEAD_BASE),
+                lookahead_speed_gain=float(self.ppo_configs.GUIDANCE_LOOKAHEAD_SPEED_GAIN),
+                lookahead_min=float(self.ppo_configs.GUIDANCE_LOOKAHEAD_MIN),
+                lookahead_max=float(self.ppo_configs.GUIDANCE_LOOKAHEAD_MAX),
+                progress_search_window=int(self.ppo_configs.GUIDANCE_PROGRESS_WINDOW),
+                min_clearance_m=float(self.ppo_configs.GUIDANCE_MIN_CLEARANCE_M),
+                full_clearance_m=float(self.ppo_configs.GUIDANCE_FULL_CLEARANCE_M),
+                near_obs_dist_m=float(self.ppo_configs.GUIDANCE_NEAR_OBS_DIST_M),
+                max_dense_ratio=float(self.ppo_configs.GUIDANCE_MAX_DENSE_RATIO),
+            )
 
     def _build_action_mask_inflation_offsets(self, grid_index) -> List[Tuple[int, int]]:
         if grid_index is None:
@@ -530,6 +578,276 @@ class PPOPrimitivePathPlanner:
                     offsets.append((dx, dy))
         return offsets
 
+    def _control_repeat_count(self) -> int:
+        return max(int(round(float(self.primitive_interval_ms) / float(self.control_interval_ms))), 1)
+
+    @staticmethod
+    def _state_cache_row(state: ArticulatedState) -> np.ndarray:
+        return np.array(
+            [
+                float(state.x),
+                float(state.y),
+                float(state.heading),
+                float(state.rear_heading),
+                0.0 if state.speed is None else float(state.speed),
+                float(getattr(state, "steering", 0.0)),
+            ],
+            dtype=np.float64,
+        )
+
+    def _ensure_control_prefix_cache(self, participant) -> None:
+        repeat_count = self._control_repeat_count()
+        if (
+            self._control_prefix_state_cache is not None
+            and self._control_prefix_cache_repeat_count == repeat_count
+        ):
+            return
+
+        actions = np.asarray(getattr(self.primitive_library, "actions"), dtype=np.float64)
+        total_primitives = int(actions.shape[0])
+        total_control_steps = int(actions.shape[1]) * repeat_count
+        cache = np.zeros((total_primitives, total_control_steps + 1, 6), dtype=np.float64)
+        physics_model = participant.physics_model
+
+        for primitive_id in range(total_primitives):
+            state = ArticulatedState(
+                frame=0,
+                x=0.0,
+                y=0.0,
+                heading=0.0,
+                speed=0.0,
+                accel=0.0,
+                rear_heading=0.0,
+                steering=0.0,
+            )
+            state = physics_model.ensure_articulated_state(state)
+            cache[primitive_id, 0] = self._state_cache_row(state)
+            control_idx = 0
+            for steering_rate, speed in actions[primitive_id]:
+                for _ in range(repeat_count):
+                    state, _, _ = physics_model.step(
+                        state=state,
+                        steering=float(steering_rate),
+                        speed=float(speed),
+                        interval=self.control_interval_ms,
+                    )
+                    control_idx += 1
+                    cache[primitive_id, control_idx] = self._state_cache_row(state)
+
+        self._control_prefix_state_cache = cache
+        self._control_prefix_cache_repeat_count = repeat_count
+        self._control_prefix_cache_control_steps = total_control_steps
+
+    def _compose_cached_state(
+        self,
+        current_state: ArticulatedState,
+        cache_row: np.ndarray,
+        control_step_index: int,
+    ) -> ArticulatedState:
+        base_heading = float(current_state.heading)
+        local_x = float(cache_row[0])
+        local_y = float(cache_row[1])
+        cos_heading = math.cos(base_heading)
+        sin_heading = math.sin(base_heading)
+        world_x = float(current_state.x) + cos_heading * local_x - sin_heading * local_y
+        world_y = float(current_state.y) + sin_heading * local_x + cos_heading * local_y
+        front_heading = _wrap_pi(base_heading + float(cache_row[2]))
+        rear_heading = _wrap_pi(float(current_state.rear_heading) + float(cache_row[3]))
+        return ArticulatedState(
+            frame=int(current_state.frame + control_step_index * self.control_interval_ms),
+            x=world_x,
+            y=world_y,
+            heading=front_heading,
+            speed=float(cache_row[4]),
+            accel=0.0,
+            rear_heading=rear_heading,
+            steering=float(cache_row[5]),
+        )
+
+    def _cached_prefix_state(
+        self,
+        participant,
+        current_state: ArticulatedState,
+        primitive_id: int,
+        control_prefix_steps: int,
+    ) -> ArticulatedState:
+        self._ensure_control_prefix_cache(participant)
+        if self._control_prefix_state_cache is None:
+            return current_state
+        max_steps = min(
+            max(int(control_prefix_steps), 0),
+            int(self._control_prefix_state_cache.shape[1] - 1),
+        )
+        if max_steps <= 0:
+            return current_state
+        cache_row = self._control_prefix_state_cache[int(primitive_id), max_steps]
+        return self._compose_cached_state(current_state, cache_row, max_steps)
+
+    def _cached_prefix_rollout(
+        self,
+        participant,
+        current_state: ArticulatedState,
+        primitive_id: int,
+        control_prefix_steps: int,
+    ) -> List[ArticulatedState]:
+        self._ensure_control_prefix_cache(participant)
+        if self._control_prefix_state_cache is None:
+            return [current_state]
+        max_steps = min(
+            max(int(control_prefix_steps), 0),
+            int(self._control_prefix_state_cache.shape[1] - 1),
+        )
+        states = [current_state]
+        for control_idx in range(1, max_steps + 1):
+            cache_row = self._control_prefix_state_cache[int(primitive_id), control_idx]
+            states.append(self._compose_cached_state(current_state, cache_row, control_idx))
+        return states
+
+    def _stationary_prefix_rollout(
+        self,
+        current_state: ArticulatedState,
+        control_prefix_steps: int,
+    ) -> List[ArticulatedState]:
+        states = [current_state]
+        for control_idx in range(1, max(int(control_prefix_steps), 0) + 1):
+            states.append(
+                ArticulatedState(
+                    frame=int(current_state.frame + control_idx * self.control_interval_ms),
+                    x=float(current_state.x),
+                    y=float(current_state.y),
+                    heading=float(current_state.heading),
+                    speed=0.0,
+                    accel=0.0,
+                    rear_heading=float(current_state.rear_heading),
+                    steering=0.0,
+                )
+            )
+        return states
+
+    def _compute_safe_prefix_steps(self, observation: Optional[np.ndarray]) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+        index = getattr(self, "_ray_safety_index", None)
+        if observation is None or index is None:
+            return None, {}
+
+        lidar_num = int(getattr(self.ppo_configs, "LIDAR_NUM", 120))
+        lidar_range = float(getattr(self.ppo_configs, "LIDAR_RANGE", 30.0))
+        lidar = np.asarray(observation, dtype=np.float64).reshape(-1)[:lidar_num]
+        if lidar.size < lidar_num:
+            padded = np.ones((lidar_num,), dtype=np.float64)
+            padded[: lidar.size] = lidar
+            lidar = padded
+
+        dist_obs = np.clip(lidar, 0.0, 1.0) * lidar_range
+        dist_star = np.asarray(index.dist_star, dtype=np.float32)
+        ray_count = min(int(dist_star.shape[2]), int(dist_obs.shape[0]))
+        safe_by_ray = dist_star[:, :, :ray_count] <= dist_obs[:ray_count][None, None, :]
+        safe_step = np.all(safe_by_ray, axis=2)
+        prefix_safe = np.cumprod(safe_step.astype(np.int8), axis=1)
+        prefix_steps = np.sum(prefix_safe, axis=1).astype(np.int32)
+        debug = {
+            "positive_step_count": int(np.count_nonzero(prefix_steps > 0)),
+            "safe_step_len_mean": float(np.mean(prefix_steps)) if prefix_steps.size else 0.0,
+            "safe_step_len_min": float(np.min(prefix_steps)) if prefix_steps.size else 0.0,
+            "safe_step_len_max": float(np.max(prefix_steps)) if prefix_steps.size else 0.0,
+        }
+        return prefix_steps, debug
+
+    def _soft_mask_from_prefix_steps(self, prefix_steps: np.ndarray, gamma: float, eps: float) -> np.ndarray:
+        horizon = max(float(self.primitive_library.horizon), 1.0)
+        soft = np.power(np.clip(np.asarray(prefix_steps, dtype=np.float32) / horizon, 0.0, 1.0), float(gamma))
+        return np.clip(soft, float(eps), 1.0).astype(np.float32)
+
+    def _terminal_context_active(
+        self,
+        scene,
+        current_state: ArticulatedState,
+        positive_count: Optional[int] = None,
+    ) -> bool:
+        terminal = self._goal_distance(scene, current_state) <= float(self.soft_mask_terminal_radius)
+        if positive_count is None:
+            return terminal
+        return bool(terminal or positive_count < int(self.soft_mask_min_action_count))
+
+    def _target_boxes(self, scene) -> Optional[Tuple[Polygon, ...]]:
+        raw_boxes = scene.map_.customs.get("target_boxes")
+        if raw_boxes is None:
+            return None
+        boxes: List[Polygon] = []
+        for box_geom in raw_boxes:
+            if box_geom is None:
+                continue
+            boxes.append(box_geom if isinstance(box_geom, Polygon) else Polygon(box_geom))
+        return tuple(boxes) if boxes else None
+
+    def _terminal_state_metrics(self, scene, state: ArticulatedState) -> Dict[str, float]:
+        dest_state = scene.map_.customs.get("dest_state")
+        position_error = self._goal_distance(scene, state)
+        heading_error = 0.0
+        articulation_error = 0.0
+        if dest_state is not None:
+            heading_error = abs(_wrap_pi(float(state.heading) - float(dest_state.heading)))
+            articulation_error = abs(
+                _wrap_pi(float(state.articulation_angle) - float(getattr(dest_state, "articulation_angle", 0.0)))
+            )
+
+        front_overlap = 0.0
+        rear_overlap = 0.0
+        mean_overlap = 0.0
+        target_boxes = self._target_boxes(scene)
+        if target_boxes:
+            current_boxes = tuple(Polygon(box_ring) for box_ring in self._state_boxes(state))
+            overlaps = []
+            for current_box, target_box in zip(current_boxes, target_boxes):
+                area_target = float(target_box.area) + 1e-9
+                overlap_area = float(current_box.intersection(target_box).area)
+                overlaps.append(float(overlap_area / area_target))
+            if overlaps:
+                front_overlap = float(overlaps[0])
+                rear_overlap = float(overlaps[1]) if len(overlaps) > 1 else float(overlaps[0])
+                mean_overlap = float(np.mean(overlaps))
+
+        return {
+            "position_error": float(position_error),
+            "heading_error_rad": float(heading_error),
+            "heading_error_deg": float(np.degrees(heading_error)),
+            "articulation_error_rad": float(articulation_error),
+            "front_overlap": float(front_overlap),
+            "rear_overlap": float(rear_overlap),
+            "mean_overlap": float(mean_overlap),
+            "speed_abs": abs(0.0 if state.speed is None else float(state.speed)),
+        }
+
+    def _is_precisely_parked(self, scene, state: ArticulatedState, *, require_stop_speed: bool) -> bool:
+        target_boxes = self._target_boxes(scene)
+        if not target_boxes:
+            return False
+        metrics = self._terminal_state_metrics(scene, state)
+        if require_stop_speed and metrics["speed_abs"] > float(self.parked_stop_speed_mps):
+            return False
+        return bool(
+            metrics["heading_error_deg"] <= float(self.terminal_heading_tolerance_deg)
+            and metrics["mean_overlap"] >= float(self.terminal_overlap_target)
+            and metrics["front_overlap"] >= float(self.terminal_front_overlap_target)
+            and metrics["rear_overlap"] >= float(self.terminal_rear_overlap_min)
+        )
+
+    def _terminal_candidate_key(self, metrics: Dict[str, float], control_prefix_steps: int) -> Tuple[float, ...]:
+        front_overlap_deficit = max(0.0, float(self.terminal_front_overlap_target) - float(metrics["front_overlap"]))
+        mean_overlap_deficit = max(0.0, float(self.terminal_overlap_target) - float(metrics["mean_overlap"]))
+        rear_overlap_deficit = max(0.0, float(self.terminal_rear_overlap_min) - float(metrics["rear_overlap"]))
+        return (
+            float(front_overlap_deficit > 1e-6),
+            float(mean_overlap_deficit > 1e-6),
+            float(rear_overlap_deficit > 1e-6),
+            float(front_overlap_deficit),
+            float(mean_overlap_deficit),
+            float(rear_overlap_deficit),
+            float(metrics["position_error"]),
+            float(metrics["heading_error_rad"]),
+            float(metrics["articulation_error_rad"]),
+            float(control_prefix_steps),
+        )
+
     def _build_occupied_cells_from_lidar(self, lidar_norm: np.ndarray):
         if self._action_mask_index is None:
             return None
@@ -537,10 +855,11 @@ class PPOPrimitivePathPlanner:
         lidar_values = np.asarray(lidar_norm, dtype=np.float64).reshape(-1)
         lidar_num = int(getattr(self.ppo_configs, "LIDAR_NUM", lidar_values.shape[0]))
         lidar_range = float(getattr(self.ppo_configs, "LIDAR_RANGE", 30.0))
-        if lidar_values.shape[0] != lidar_num:
-            lidar_values = lidar_values[:lidar_num]
+        lidar_values = lidar_values[:lidar_num]
+        if lidar_values.shape[0] == 0:
+            return set()
 
-        beam_angles = np.linspace(0.0, 2.0 * math.pi, lidar_num, endpoint=False)
+        beam_angles = np.linspace(0.0, 2.0 * math.pi, lidar_values.shape[0], endpoint=False)
         distances = np.clip(lidar_values, 0.0, 1.0) * lidar_range
         hit_mask = distances < (0.98 * lidar_range)
         occupied_cells = set()
@@ -583,55 +902,148 @@ class PPOPrimitivePathPlanner:
         except Exception:
             return None
 
-    @staticmethod
-    def _build_primitive_metadata(primitive_library, library_path: str) -> Tuple[Dict[int, Dict[str, Any]], set]:
-        primitive_meta = _load_primitive_sidecar_meta(library_path)
-        primitive_meta_by_id: Dict[int, Dict[str, Any]] = {}
-        adaptive_primitive_ids = set()
+    def _terminal_weights_from_observation(self, observation: np.ndarray) -> np.ndarray:
+        n_actions = int(self.primitive_library.size)
+        deltas = getattr(self.primitive_library, "deltas", None)
+        if deltas is None:
+            return np.ones((n_actions,), dtype=np.float32)
+        deltas = np.asarray(deltas, dtype=np.float64)
+        if deltas.shape[0] != n_actions or deltas.shape[1] < 3:
+            return np.ones((n_actions,), dtype=np.float32)
 
-        for default_primitive_id in range(int(primitive_library.size)):
-            primitive_meta_by_id[default_primitive_id] = {
-                "primitive_id": int(default_primitive_id),
-                "added_round": None,
-            }
+        lidar_num = int(getattr(self.ppo_configs, "LIDAR_NUM", 120))
+        target = np.asarray(observation, dtype=np.float64).reshape(-1)[lidar_num : lidar_num + 7]
+        if target.shape[0] < 7:
+            return np.ones((n_actions,), dtype=np.float32)
 
-        for default_primitive_id, item in enumerate(primitive_meta):
-            primitive_id = int(item.get("primitive_id", default_primitive_id))
-            normalized_item = dict(item)
-            added_round = normalized_item.get("added_round")
-            if added_round is not None:
-                try:
-                    added_round = int(added_round)
-                except Exception:
-                    added_round = None
-            normalized_item["added_round"] = added_round
-            normalized_item["primitive_id"] = primitive_id
-            primitive_meta_by_id[primitive_id] = normalized_item
-            if added_round is not None and added_round >= 0:
-                adaptive_primitive_ids.add(primitive_id)
+        dist = float(target[0]) * float(getattr(self.ppo_configs, "MAX_DIST_TO_DEST", 70.0))
+        rel_angle = math.atan2(float(target[2]), float(target[1]))
+        rel_heading = math.atan2(float(target[4]), float(target[3]))
+        articulation = math.atan2(float(target[6]), float(target[5]))
+        goal_x = dist * math.cos(rel_angle)
+        goal_y = dist * math.sin(rel_angle)
 
-        return primitive_meta_by_id, adaptive_primitive_ids
+        radius = max(float(self.soft_mask_terminal_radius), 1e-6)
+        heading_scale = max(float(self.soft_mask_terminal_heading_scale), 1e-6)
+        articulation_scale = max(float(self.soft_mask_terminal_articulation_scale), 1e-6)
+        dx = deltas[:, 0]
+        dy = deltas[:, 1]
+        dtheta = deltas[:, 2]
+        dgamma = deltas[:, 3] if deltas.shape[1] > 3 else np.zeros_like(dtheta)
+        pos_after = np.sqrt((goal_x - dx) * (goal_x - dx) + (goal_y - dy) * (goal_y - dy))
+        heading_err = np.abs((rel_heading - dtheta + np.pi) % (2.0 * np.pi) - np.pi)
+        articulation_err = np.abs((articulation - dgamma + np.pi) % (2.0 * np.pi) - np.pi)
+        progress = np.clip((max(dist, 1e-6) - pos_after) / radius, -1.0, 1.0)
+        pos_score = np.exp(-np.square(pos_after / radius))
+        heading_score = np.exp(-np.square(heading_err / heading_scale))
+        articulation_score = np.exp(-np.square(articulation_err / articulation_scale))
+        weights = (
+            0.72
+            + 0.28 * pos_score
+            + 0.22 * heading_score
+            + 0.08 * articulation_score
+            + 0.18 * np.maximum(progress, 0.0)
+            - 0.10 * np.maximum(-progress, 0.0)
+        )
+        return np.clip(
+            weights,
+            float(self.soft_mask_terminal_weight_min),
+            float(self.soft_mask_terminal_weight_max),
+        ).astype(np.float32)
 
-    @staticmethod
-    def _normalize_action_mask_mode(mode: object) -> str:
-        normalized = str(mode).strip().lower()
-        if normalized == "hyrbid":
-            normalized = "hybrid"
-        if normalized not in {"fast_only", "hybrid", "full"}:
-            normalized = "hybrid"
-        return normalized
+    def _compute_soft_ray_action_mask(
+        self,
+        scene,
+        current_state: ArticulatedState,
+        observation: Optional[np.ndarray],
+    ) -> np.ndarray:
+        started_at = time.perf_counter()
+        total_actions = int(self.primitive_library.size)
+        eps = float(self.soft_mask_eps)
+        index = getattr(self, "_ray_safety_index", None)
+        stats = {
+            "precomputed_available": self._action_mask_index is not None,
+            "precomputed_used": False,
+            "precomputed_candidate_count": None,
+            "precomputed_fallback_to_full": False,
+            "precomputed_index_kind": None
+            if self._action_mask_index is None
+            else str(getattr(self._action_mask_index, "index_kind", "unknown")),
+            "precomputed_index_source": self._action_mask_index_source,
+            "ray_safety_available": index is not None,
+            "ray_safety_used": False,
+            "soft_terminal_reweight_applied": False,
+            "soft_mask_fallback": None,
+        }
 
-    def _load_runtime_assets(self):
-        cache_key = self._runtime_asset_cache_key()
-        runtime_assets = self._RUNTIME_ASSET_CACHE.get(cache_key)
-        if runtime_assets is None:
-            runtime_assets = self._build_runtime_assets()
-            self._RUNTIME_ASSET_CACHE[cache_key] = runtime_assets
-            self.runtime_asset_cache_hit = False
+        self._last_safe_prefix_steps = None
+
+        if observation is None:
+            mask = np.ones((total_actions,), dtype=np.float32)
+            stats["soft_mask_fallback"] = "missing_observation"
+            self._safe_prefix_steps_cached = None
+        elif index is None:
+            candidate_ids = self._get_action_mask_candidate_ids(observation, total_actions)
+            mask = np.full((total_actions,), eps, dtype=np.float32)
+            if candidate_ids is None:
+                mask[:] = 1.0
+                stats["soft_mask_fallback"] = "no_ray_safety_no_fast_index"
+                stats["precomputed_fallback_to_full"] = True
+            else:
+                mask[np.asarray(candidate_ids, dtype=np.int64)] = 1.0
+                stats["soft_mask_fallback"] = "fast_prune"
+                stats["precomputed_used"] = True
+                stats["precomputed_candidate_count"] = int(candidate_ids.shape[0])
+            self._safe_prefix_steps_cached = None
         else:
-            self.runtime_asset_cache_hit = True
+            prefix_steps, debug = self._compute_safe_prefix_steps(observation)
+            if prefix_steps is None:
+                mask = np.ones((total_actions,), dtype=np.float32)
+                self._safe_prefix_steps_cached = None
+            else:
+                mask = self._soft_mask_from_prefix_steps(
+                    prefix_steps,
+                    gamma=float(self.soft_mask_gamma),
+                    eps=eps,
+                )
+                self._safe_prefix_steps_cached = prefix_steps.copy()
+                self._last_safe_prefix_steps = prefix_steps.copy()
+            stats.update(debug)
+            stats["ray_safety_used"] = True
 
-        self._apply_runtime_assets(runtime_assets)
+            positive_count = int(debug.get("positive_step_count", 0))
+            terminal_context = self._terminal_context_active(
+                scene,
+                current_state,
+                positive_count=positive_count,
+            )
+            if terminal_context:
+                terminal_mask = self._soft_mask_from_prefix_steps(
+                    prefix_steps,
+                    gamma=float(self.soft_mask_terminal_gamma),
+                    eps=float(self.soft_mask_terminal_eps),
+                )
+                terminal_debug = dict(debug)
+                terminal_weights = self._terminal_weights_from_observation(observation)
+                mask = np.clip(
+                    terminal_mask * terminal_weights,
+                    float(self.soft_mask_terminal_eps),
+                    1.0,
+                ).astype(np.float32)
+                stats.update({f"terminal_{key}": value for key, value in terminal_debug.items()})
+                stats["soft_terminal_reweight_applied"] = True
+
+        stats["soft_mask_ms"] = float((time.perf_counter() - started_at) * 1000.0)
+        stats["soft_mask_min"] = float(np.min(mask)) if mask.size else 0.0
+        stats["soft_mask_max"] = float(np.max(mask)) if mask.size else 0.0
+        stats["soft_mask_mean"] = float(np.mean(mask)) if mask.size else 0.0
+        stats["soft_effective_action_count"] = int(np.count_nonzero(mask > (float(np.min(mask)) + 1e-6)))
+        if self._last_safe_prefix_steps is not None:
+            stats["safe_prefix_step_len_mean"] = float(np.mean(self._last_safe_prefix_steps))
+            stats["safe_prefix_step_len_min"] = float(np.min(self._last_safe_prefix_steps))
+            stats["safe_prefix_step_len_max"] = float(np.max(self._last_safe_prefix_steps))
+        self._last_action_mask_stats = stats
+        return mask.astype(np.float32)
 
     def _obstacle_geometries(self, scene) -> List[Any]:
         geometries = []
@@ -731,6 +1143,176 @@ class PPOPrimitivePathPlanner:
             )
         return observation
 
+    def _lidar_distances_from_observation(self, observation: Optional[np.ndarray]) -> np.ndarray:
+        lidar_num = int(getattr(self.ppo_configs, "LIDAR_NUM", 120))
+        lidar_range = float(getattr(self.ppo_configs, "LIDAR_RANGE", 30.0))
+        if observation is None:
+            return np.full((lidar_num,), lidar_range, dtype=np.float64)
+
+        lidar = np.asarray(observation, dtype=np.float64).reshape(-1)[:lidar_num]
+        if lidar.shape[0] < lidar_num:
+            padded = np.ones((lidar_num,), dtype=np.float64)
+            padded[: lidar.shape[0]] = lidar
+            lidar = padded
+        return np.clip(lidar, 0.0, 1.0) * lidar_range
+
+    def _directional_sector_for_primitive(
+        self,
+        current_state: ArticulatedState,
+        primitive_actions: np.ndarray,
+    ) -> Tuple[float, float, float, float, float]:
+        primitive_actions = np.asarray(primitive_actions, dtype=np.float64).reshape(-1, 2)
+        if primitive_actions.shape[0] == 0:
+            return 0.0, float(self.safety_forward_sector_half_angle), 0.0, 0.0, 0.0
+
+        steering_rate = float(primitive_actions[0, 0])
+        speed = float(primitive_actions[0, 1])
+        primitive_dt = max(float(self.primitive_interval_ms) / 1000.0, 1e-6)
+        current_steering = 0.0 if getattr(current_state, "steering", None) is None else float(current_state.steering)
+        projected_steering = current_steering + steering_rate * primitive_dt
+        direction_base = 0.0 if speed >= 0.0 else math.pi
+        sector_center = _wrap_pi(direction_base + projected_steering * float(self.safety_steering_sector_center_gain))
+        sector_half_angle = float(self.safety_forward_sector_half_angle) + abs(projected_steering) * float(
+            self.safety_steering_sector_half_angle_gain
+        )
+        sector_half_angle = float(
+            np.clip(
+                sector_half_angle,
+                float(self.safety_forward_sector_half_angle),
+                float(self.safety_forward_sector_max_half_angle),
+            )
+        )
+        projected_travel = abs(speed) * primitive_dt
+        return sector_center, sector_half_angle, projected_travel, steering_rate, speed
+
+    def _distance_to_boundary_along_world_angle(
+        self,
+        scene,
+        current_state: ArticulatedState,
+        world_angle: float,
+    ) -> float:
+        min_x, max_x, min_y, max_y = scene.map_.boundary
+        origin_x = float(current_state.x)
+        origin_y = float(current_state.y)
+        direction_x = math.cos(world_angle)
+        direction_y = math.sin(world_angle)
+        candidates: List[float] = []
+
+        if abs(direction_x) > 1e-9:
+            for edge_x in (min_x, max_x):
+                distance = (float(edge_x) - origin_x) / direction_x
+                if distance < 0.0:
+                    continue
+                hit_y = origin_y + distance * direction_y
+                if float(min_y) - 1e-6 <= hit_y <= float(max_y) + 1e-6:
+                    candidates.append(float(distance))
+
+        if abs(direction_y) > 1e-9:
+            for edge_y in (min_y, max_y):
+                distance = (float(edge_y) - origin_y) / direction_y
+                if distance < 0.0:
+                    continue
+                hit_x = origin_x + distance * direction_x
+                if float(min_x) - 1e-6 <= hit_x <= float(max_x) + 1e-6:
+                    candidates.append(float(distance))
+
+        if not candidates:
+            return float("inf")
+        return float(min(candidates))
+
+    def _directional_clearance(
+        self,
+        scene,
+        current_state: ArticulatedState,
+        observation: Optional[np.ndarray],
+        sector_center: float,
+        sector_half_angle: float,
+    ) -> Dict[str, Any]:
+        lidar_distances = self._lidar_distances_from_observation(observation)
+        if lidar_distances.shape[0] == 0:
+            lidar_range = float(getattr(self.ppo_configs, "LIDAR_RANGE", 30.0))
+            return {
+                "sector_lidar_distance_m": lidar_range,
+                "sector_boundary_distance_m": float("inf"),
+                "sector_clearance_distance_m": lidar_range,
+                "sector_beam_count": 0,
+            }
+
+        beam_angles = np.linspace(0.0, 2.0 * math.pi, lidar_distances.shape[0], endpoint=False)
+        angular_error = np.abs(np.array([_wrap_pi(angle - sector_center) for angle in beam_angles], dtype=np.float64))
+        sector_mask = angular_error <= max(float(sector_half_angle), math.pi / float(lidar_distances.shape[0]))
+        if not np.any(sector_mask):
+            sector_mask[int(np.argmin(angular_error))] = True
+        sector_lidar_distance = float(np.min(lidar_distances[sector_mask]))
+
+        sample_angles = [
+            _wrap_pi(sector_center - sector_half_angle),
+            _wrap_pi(sector_center),
+            _wrap_pi(sector_center + sector_half_angle),
+        ]
+        boundary_distance = min(
+            self._distance_to_boundary_along_world_angle(
+                scene,
+                current_state,
+                float(current_state.heading) + sample_angle,
+            )
+            for sample_angle in sample_angles
+        )
+        clearance_distance = float(min(sector_lidar_distance, boundary_distance))
+        return {
+            "sector_lidar_distance_m": sector_lidar_distance,
+            "sector_boundary_distance_m": float(boundary_distance),
+            "sector_clearance_distance_m": clearance_distance,
+            "sector_beam_count": int(np.count_nonzero(sector_mask)),
+        }
+
+    def _evaluate_directional_stop(
+        self,
+        scene,
+        current_state: ArticulatedState,
+        observation: Optional[np.ndarray],
+        primitive_actions: np.ndarray,
+        *,
+        store: bool = True,
+    ) -> Dict[str, Any]:
+        sector_center, sector_half_angle, projected_travel, steering_rate, speed = self._directional_sector_for_primitive(
+            current_state,
+            primitive_actions,
+        )
+        clearance = self._directional_clearance(
+            scene,
+            current_state,
+            observation,
+            sector_center,
+            sector_half_angle,
+        )
+        predicted_collision_distance = float(projected_travel + float(self.safety_collision_buffer_m))
+        continue_will_collide = bool(abs(speed) > 1e-6 and clearance["sector_clearance_distance_m"] <= predicted_collision_distance)
+        stop_triggered = bool(
+            clearance["sector_clearance_distance_m"] <= float(self.safety_stop_distance_m)
+            and continue_will_collide
+        )
+        stats = {
+            "stop_triggered": stop_triggered,
+            "stop_reason": "directional_clearance" if stop_triggered else None,
+            "stop_replan_requested": bool(stop_triggered and self.replan_on_emergency_stop),
+            "stop_lidar_distance_m": float(clearance["sector_lidar_distance_m"]),
+            "stop_boundary_distance_m": float(clearance["sector_boundary_distance_m"]),
+            "stop_clearance_distance_m": float(clearance["sector_clearance_distance_m"]),
+            "stop_sector_center_rad": float(sector_center),
+            "stop_sector_half_angle_rad": float(sector_half_angle),
+            "stop_sector_beam_count": int(clearance["sector_beam_count"]),
+            "stop_projected_travel_m": float(projected_travel),
+            "stop_predicted_collision_distance_m": predicted_collision_distance,
+            "stop_first_speed": float(speed),
+            "stop_first_steering_rate": float(steering_rate),
+            "stop_safety_distance_m": float(self.safety_stop_distance_m),
+            "stop_continue_will_collide": continue_will_collide,
+        }
+        if store:
+            self._last_safety_stop_stats = stats
+        return stats
+
     def _goal_distance(self, scene, state: ArticulatedState) -> float:
         dest_state = scene.map_.customs.get("dest_state")
         if dest_state is not None:
@@ -770,17 +1352,52 @@ class PPOPrimitivePathPlanner:
         return bool(float(state.x) < min_x or float(state.x) > max_x or float(state.y) < min_y or float(state.y) > max_y)
 
     def _ranked_primitive_ids(self, observation: np.ndarray, action_mask: Optional[np.ndarray] = None) -> np.ndarray:
+        candidates = self._ranked_primitive_candidates(observation, action_mask=action_mask)
+        if not candidates:
+            return np.zeros((0,), dtype=np.int64)
+        return np.asarray([candidate["primitive_id"] for candidate in candidates], dtype=np.int64)
+
+    def _ranked_primitive_candidates(
+        self,
+        observation: np.ndarray,
+        action_mask: Optional[np.ndarray] = None,
+    ) -> List[Dict[str, Any]]:
         action_dist = self.agent._actor_forward(observation, action_mask=action_mask)
         probabilities = action_dist.probs.detach().cpu().numpy().reshape(-1)
         ranked_ids = np.argsort(probabilities)[::-1]
         limit = min(int(self.max_candidate_primitives), int(ranked_ids.shape[0]))
-        return ranked_ids[:limit]
+        return [
+            {
+                "primitive_id": int(primitive_id),
+                "probability": float(probabilities[int(primitive_id)]),
+                "rank": int(rank),
+            }
+            for rank, primitive_id in enumerate(ranked_ids[:limit])
+        ]
 
     def _is_rollout_feasible(self, scene, rollout_states: Sequence[ArticulatedState]) -> bool:
         for rollout_state in rollout_states[1:]:
             if self._state_out_of_bounds(scene, rollout_state) or self._state_hits_obstacle(scene, rollout_state):
                 return False
         return True
+
+    def _choose_emergency_primitive_id(self) -> int:
+        configured = self.emergency_primitive_id
+        if configured is not None:
+            try:
+                configured_id = int(configured)
+                if 0 <= configured_id < int(self.primitive_library.size):
+                    return configured_id
+            except Exception:
+                pass
+
+        actions = np.asarray(getattr(self.primitive_library, "actions"), dtype=np.float64)
+        deltas = np.asarray(getattr(self.primitive_library, "deltas"), dtype=np.float64)
+        speed_cost = np.mean(np.abs(actions[:, :, 1]), axis=1)
+        steer_cost = 0.25 * np.mean(np.abs(actions[:, :, 0]), axis=1)
+        delta_cost = 0.15 * np.linalg.norm(deltas[:, :2], axis=1) if deltas.ndim == 2 and deltas.shape[1] >= 2 else 0.0
+        cost = speed_cost + steer_cost + delta_cost
+        return int(np.argmin(cost))
 
     def _compute_action_mask(
         self,
@@ -790,6 +1407,8 @@ class PPOPrimitivePathPlanner:
         observation: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if (
+            self.action_mask_mode != "soft_ray"
+            and
             self._action_mask_cached is not None
             and self._action_mask_calls_since_update < (self.action_mask_update_every_k - 1)
         ):
@@ -803,10 +1422,20 @@ class PPOPrimitivePathPlanner:
                 if self._action_mask_index is None
                 else str(getattr(self._action_mask_index, "index_kind", "unknown")),
                 "precomputed_index_source": self._action_mask_index_source,
+                "ray_safety_available": self._ray_safety_index is not None,
+                "soft_mask_ms": None,
+                "soft_effective_action_count": None,
             }
             return self._action_mask_cached.copy()
 
         total_actions = int(self.primitive_library.size)
+
+        if self.action_mask_mode == "soft_ray":
+            mask = self._compute_soft_ray_action_mask(scene, current_state, observation)
+            self._action_mask_cached = mask.copy()
+            self._action_mask_calls_since_update = 0
+            return mask
+
         candidate_ids = None
         precomputed_used = False
         if self.action_mask_mode != "full":
@@ -822,11 +1451,15 @@ class PPOPrimitivePathPlanner:
             if self._action_mask_index is None
             else str(getattr(self._action_mask_index, "index_kind", "unknown")),
             "precomputed_index_source": self._action_mask_index_source,
+            "ray_safety_available": self._ray_safety_index is not None,
+            "soft_mask_ms": None,
+            "soft_effective_action_count": None,
         }
 
         if self.action_mask_mode == "fast_only":
             if candidate_ids is None:
                 mask = np.ones(total_actions, dtype=np.int8)
+                self._last_action_mask_stats["precomputed_fallback_to_full"] = True
             else:
                 mask = np.zeros(total_actions, dtype=np.int8)
                 mask[candidate_ids] = 1
@@ -846,8 +1479,14 @@ class PPOPrimitivePathPlanner:
 
         for primitive_id in eval_ids:
             primitive_actions = np.asarray(self.primitive_library.get_actions(int(primitive_id)), dtype=np.float64)
-            rollout_states = self._rollout_primitive(participant, primitive_actions, state=current_state)
-            if self._is_rollout_feasible(scene, rollout_states):
+            stop_stats = self._evaluate_directional_stop(
+                scene,
+                current_state,
+                observation,
+                primitive_actions,
+                store=False,
+            )
+            if not bool(stop_stats["stop_triggered"]):
                 mask[int(primitive_id)] = 1
 
         if not mask.any():
@@ -871,6 +1510,215 @@ class PPOPrimitivePathPlanner:
             if self.use_action_mask
             else None
         )
+        prefix_mode = self.action_mask_mode == "soft_ray" and self._ray_safety_index is not None
+        if prefix_mode:
+            ranked_candidates = self._ranked_primitive_candidates(observation, action_mask=action_mask)
+            safe_prefix_steps = self._last_safe_prefix_steps
+            if safe_prefix_steps is None:
+                safe_prefix_steps = np.zeros((int(self.primitive_library.size),), dtype=np.int32)
+
+            repeat_count = self._control_repeat_count()
+            total_control_horizon = int(self.primitive_library.horizon) * repeat_count
+            terminal_mode = self._terminal_context_active(
+                scene,
+                current_state,
+                positive_count=int(np.count_nonzero(safe_prefix_steps > 0)),
+            )
+            selected_primitive_id = int(ranked_candidates[0]["primitive_id"]) if ranked_candidates else -1
+            selected_safe_prefix_steps = (
+                int(safe_prefix_steps[selected_primitive_id]) if 0 <= selected_primitive_id < safe_prefix_steps.shape[0] else 0
+            )
+
+            if self._is_precisely_parked(scene, current_state, require_stop_speed=False):
+                emergency_id = self._choose_emergency_primitive_id()
+                control_prefix_steps = repeat_count
+                zero_actions = np.zeros((1, 2), dtype=np.float64)
+                self._last_safety_stop_stats = {
+                    "stop_triggered": False,
+                    "stop_reason": "parked_latch",
+                    "stop_replan_requested": False,
+                }
+                self._last_guard_stats = {
+                    "guard_enabled": True,
+                    "guard_attempts": int(min(len(ranked_candidates), self.max_guard_candidates)),
+                    "guard_selected_failed": False,
+                    "guard_fallback_used": bool(selected_primitive_id != int(emergency_id) and selected_primitive_id >= 0),
+                    "guard_emergency_used": True,
+                    "guard_selected_primitive_id": int(selected_primitive_id),
+                    "guard_final_primitive_id": int(emergency_id),
+                    "guard_selected_safe_prefix_steps": int(selected_safe_prefix_steps),
+                    "guard_final_safe_prefix_steps": 0,
+                    "guard_control_prefix_steps": int(control_prefix_steps),
+                    "guard_prefix_truncated": True,
+                    "guard_terminal_mode": bool(terminal_mode),
+                    "guard_mode": "parked_latch",
+                }
+                selection_info = {
+                    "primitive_prefix_steps": 1,
+                    "control_prefix_steps": int(control_prefix_steps),
+                    "prefix_truncated": True,
+                    "replan_when_controls_exhausted": False,
+                    "terminal_mode_active": bool(terminal_mode),
+                    "parked_latch_active": True,
+                    "safe_prefix_primitive_steps": 0,
+                    "safe_prefix_control_steps": 0,
+                    "guard_mode": "parked_latch",
+                }
+                return (
+                    int(emergency_id),
+                    zero_actions,
+                    self._stationary_prefix_rollout(current_state, control_prefix_steps),
+                    action_mask,
+                    selection_info,
+                )
+
+            chosen: Optional[Dict[str, Any]] = None
+            if terminal_mode:
+                best_terminal = None
+                for candidate in ranked_candidates[: int(self.max_guard_candidates)]:
+                    primitive_id = int(candidate["primitive_id"])
+                    safe_steps = int(safe_prefix_steps[primitive_id])
+                    safe_control_steps = safe_steps * repeat_count
+                    if safe_control_steps <= 0:
+                        continue
+                    for control_prefix_steps in range(1, safe_control_steps + 1):
+                        prefix_state = self._cached_prefix_state(
+                            participant,
+                            current_state,
+                            primitive_id,
+                            control_prefix_steps,
+                        )
+                        metrics = self._terminal_state_metrics(scene, prefix_state)
+                        terminal_key = self._terminal_candidate_key(metrics, control_prefix_steps) + (
+                            -float(candidate["probability"]),
+                        )
+                        candidate_entry = {
+                            "primitive_id": primitive_id,
+                            "primitive_prefix_steps": int(math.ceil(control_prefix_steps / repeat_count)),
+                            "control_prefix_steps": int(control_prefix_steps),
+                            "safe_prefix_primitive_steps": int(safe_steps),
+                            "safe_prefix_control_steps": int(safe_control_steps),
+                            "metrics": metrics,
+                            "probability": float(candidate["probability"]),
+                            "key": terminal_key,
+                        }
+                        if best_terminal is None or candidate_entry["key"] < best_terminal["key"]:
+                            best_terminal = candidate_entry
+                chosen = best_terminal
+            else:
+                for candidate in ranked_candidates[: int(self.max_guard_candidates)]:
+                    primitive_id = int(candidate["primitive_id"])
+                    safe_steps = int(safe_prefix_steps[primitive_id])
+                    safe_control_steps = safe_steps * repeat_count
+                    if safe_control_steps <= 0:
+                        continue
+                    chosen = {
+                        "primitive_id": primitive_id,
+                        "primitive_prefix_steps": int(safe_steps),
+                        "control_prefix_steps": int(safe_control_steps),
+                        "safe_prefix_primitive_steps": int(safe_steps),
+                        "safe_prefix_control_steps": int(safe_control_steps),
+                        "metrics": self._terminal_state_metrics(
+                            scene,
+                            self._cached_prefix_state(
+                                participant,
+                                current_state,
+                                primitive_id,
+                                safe_control_steps,
+                            ),
+                        ),
+                        "probability": float(candidate["probability"]),
+                    }
+                    break
+
+            if chosen is None:
+                emergency_id = self._choose_emergency_primitive_id()
+                control_prefix_steps = repeat_count
+                zero_actions = np.zeros((1, 2), dtype=np.float64)
+                self._last_safety_stop_stats = {
+                    "stop_triggered": True,
+                    "stop_reason": "zero_safe_prefix",
+                    "stop_replan_requested": bool(self.replan_on_emergency_stop),
+                }
+                self._last_guard_stats = {
+                    "guard_enabled": True,
+                    "guard_attempts": int(min(len(ranked_candidates), self.max_guard_candidates)),
+                    "guard_selected_failed": True,
+                    "guard_fallback_used": False,
+                    "guard_emergency_used": True,
+                    "guard_selected_primitive_id": int(selected_primitive_id),
+                    "guard_final_primitive_id": int(emergency_id),
+                    "guard_selected_safe_prefix_steps": int(selected_safe_prefix_steps),
+                    "guard_final_safe_prefix_steps": 0,
+                    "guard_control_prefix_steps": int(control_prefix_steps),
+                    "guard_prefix_truncated": True,
+                    "guard_terminal_mode": bool(terminal_mode),
+                    "guard_mode": "zero_safe_prefix",
+                }
+                selection_info = {
+                    "primitive_prefix_steps": 1,
+                    "control_prefix_steps": int(control_prefix_steps),
+                    "prefix_truncated": True,
+                    "replan_when_controls_exhausted": False,
+                    "terminal_mode_active": bool(terminal_mode),
+                    "parked_latch_active": False,
+                    "safe_prefix_primitive_steps": 0,
+                    "safe_prefix_control_steps": 0,
+                    "guard_mode": "zero_safe_prefix",
+                }
+                return (
+                    int(emergency_id),
+                    zero_actions,
+                    self._stationary_prefix_rollout(current_state, control_prefix_steps),
+                    action_mask,
+                    selection_info,
+                )
+
+            primitive_id = int(chosen["primitive_id"])
+            primitive_actions_full = np.asarray(self.primitive_library.get_actions(primitive_id), dtype=np.float64)
+            primitive_prefix_steps = max(int(chosen["primitive_prefix_steps"]), 1)
+            control_prefix_steps = max(int(chosen["control_prefix_steps"]), 1)
+            primitive_actions = primitive_actions_full[:primitive_prefix_steps].copy()
+            rollout_states = self._cached_prefix_rollout(
+                participant,
+                current_state,
+                primitive_id,
+                control_prefix_steps,
+            )
+            prefix_truncated = bool(control_prefix_steps < total_control_horizon)
+            self._last_safety_stop_stats = {
+                "stop_triggered": False,
+                "stop_reason": None,
+                "stop_replan_requested": False,
+            }
+            self._last_guard_stats = {
+                "guard_enabled": True,
+                "guard_attempts": int(min(len(ranked_candidates), self.max_guard_candidates)),
+                "guard_selected_failed": bool(selected_safe_prefix_steps * repeat_count < total_control_horizon),
+                "guard_fallback_used": bool(primitive_id != selected_primitive_id),
+                "guard_emergency_used": False,
+                "guard_selected_primitive_id": int(selected_primitive_id),
+                "guard_final_primitive_id": int(primitive_id),
+                "guard_selected_safe_prefix_steps": int(selected_safe_prefix_steps),
+                "guard_final_safe_prefix_steps": int(chosen["safe_prefix_primitive_steps"]),
+                "guard_control_prefix_steps": int(control_prefix_steps),
+                "guard_prefix_truncated": bool(prefix_truncated),
+                "guard_terminal_mode": bool(terminal_mode),
+                "guard_mode": "terminal_prefix" if terminal_mode else "safe_prefix",
+            }
+            selection_info = {
+                "primitive_prefix_steps": int(primitive_prefix_steps),
+                "control_prefix_steps": int(control_prefix_steps),
+                "prefix_truncated": bool(prefix_truncated),
+                "replan_when_controls_exhausted": bool(prefix_truncated),
+                "terminal_mode_active": bool(terminal_mode),
+                "parked_latch_active": False,
+                "safe_prefix_primitive_steps": int(chosen["safe_prefix_primitive_steps"]),
+                "safe_prefix_control_steps": int(chosen["safe_prefix_control_steps"]),
+                "guard_mode": "terminal_prefix" if terminal_mode else "safe_prefix",
+            }
+            return primitive_id, primitive_actions, rollout_states, action_mask, selection_info
+
         primitive_id, _ = self.agent.choose_action(
             observation,
             deterministic=self.deterministic,
@@ -878,37 +1726,55 @@ class PPOPrimitivePathPlanner:
         )
         primitive_id = int(primitive_id)
         primitive_actions = np.asarray(self.primitive_library.get_actions(primitive_id), dtype=np.float64)
+        stop_stats = self._evaluate_directional_stop(scene, current_state, observation, primitive_actions, store=True)
+        full_control_steps = int(primitive_actions.shape[0]) * self._control_repeat_count()
+        self._last_guard_stats = {
+            "guard_enabled": self.action_mask_mode == "soft_ray",
+            "guard_attempts": 1,
+            "guard_selected_failed": bool(stop_stats["stop_triggered"]),
+            "guard_fallback_used": False,
+            "guard_emergency_used": bool(stop_stats["stop_triggered"]),
+            "guard_selected_primitive_id": int(primitive_id),
+            "guard_final_primitive_id": int(primitive_id),
+            "guard_selected_safe_prefix_steps": None,
+            "guard_final_safe_prefix_steps": None,
+            "guard_control_prefix_steps": int(full_control_steps),
+            "guard_prefix_truncated": False,
+            "guard_terminal_mode": False,
+            "guard_mode": "directional_stop_guard",
+        }
+
+        if bool(stop_stats["stop_triggered"]):
+            emergency_id = self._choose_emergency_primitive_id()
+            emergency_actions = np.zeros((1, 2), dtype=np.float64)
+            emergency_rollout = self._stationary_prefix_rollout(current_state, self._control_repeat_count())
+            self._last_guard_stats["guard_final_primitive_id"] = int(emergency_id)
+            selection_info = {
+                "primitive_prefix_steps": 1,
+                "control_prefix_steps": int(self._control_repeat_count()),
+                "prefix_truncated": True,
+                "replan_when_controls_exhausted": False,
+                "terminal_mode_active": False,
+                "parked_latch_active": False,
+                "safe_prefix_primitive_steps": 0,
+                "safe_prefix_control_steps": 0,
+                "guard_mode": "directional_stop_guard",
+            }
+            return int(emergency_id), emergency_actions, emergency_rollout, action_mask, selection_info
+
         rollout_states = self._rollout_primitive(participant, primitive_actions, state=current_state)
-
-        if not self._is_rollout_feasible(scene, rollout_states):
-            ranked_ids = self._ranked_primitive_ids(observation, action_mask=action_mask)
-            for ranked_primitive_id in ranked_ids:
-                primitive_actions = np.asarray(
-                    self.primitive_library.get_actions(int(ranked_primitive_id)),
-                    dtype=np.float64,
-                )
-                rollout_states = self._rollout_primitive(participant, primitive_actions, state=current_state)
-                if self._is_rollout_feasible(scene, rollout_states):
-                    primitive_id = int(ranked_primitive_id)
-                    break
-
-        return primitive_id, primitive_actions, rollout_states, action_mask
-
-    def _load_primitive_metadata(self, library_path: str) -> None:
-        self._primitive_meta_by_id, self._adaptive_primitive_ids = self._build_primitive_metadata(
-            self.primitive_library,
-            library_path,
-        )
-
-    def _primitive_metadata(self, primitive_id: int) -> Dict[str, Any]:
-        return dict(self._primitive_meta_by_id.get(int(primitive_id), {"primitive_id": int(primitive_id), "added_round": None}))
-
-    def _primitive_origin(self, primitive_id: int) -> str:
-        if int(primitive_id) in self._adaptive_primitive_ids:
-            return "adaptive"
-        if self._primitive_meta_by_id:
-            return "base"
-        return "unknown"
+        selection_info = {
+            "primitive_prefix_steps": int(primitive_actions.shape[0]),
+            "control_prefix_steps": int(full_control_steps),
+            "prefix_truncated": False,
+            "replan_when_controls_exhausted": False,
+            "terminal_mode_active": False,
+            "parked_latch_active": False,
+            "safe_prefix_primitive_steps": None,
+            "safe_prefix_control_steps": None,
+            "guard_mode": "directional_stop_guard",
+        }
+        return primitive_id, primitive_actions, rollout_states, action_mask, selection_info
 
     def _rollout_primitive(self, participant, primitive_actions: np.ndarray, state: Optional[ArticulatedState] = None) -> List[ArticulatedState]:
         physics_model = participant.physics_model
@@ -1027,61 +1893,31 @@ class PPOPrimitivePathPlanner:
             metadata=metadata,
         )
 
-    def get_primitive_selection_counts(self) -> Dict[int, int]:
-        return {
-            int(primitive_id): int(count)
-            for primitive_id, count in sorted(self._primitive_selection_counts.items())
-        }
-
-    def get_adaptive_primitive_selection_counts(self) -> Dict[int, int]:
-        return {
-            int(primitive_id): int(count)
-            for primitive_id, count in sorted(self._adaptive_primitive_selection_counts.items())
-        }
-
-    def get_adaptive_round_selection_counts(self) -> Dict[int, int]:
-        return {
-            int(round_id): int(count)
-            for round_id, count in sorted(self._adaptive_round_selection_counts.items())
-        }
-
     def plan(self, scene, participant) -> PPOPlanningResult:
-        plan_started_at = time.perf_counter()
         planning_state = participant.physics_model.ensure_articulated_state(participant.current_state)
         observation = self.build_observation(scene, participant, state=planning_state)
-        primitive_id, primitive_actions, rollout_states, action_mask = self._choose_closed_loop_primitive(
+        primitive_id, primitive_actions, rollout_states, action_mask, selection_info = self._choose_closed_loop_primitive(
             scene,
             participant,
             planning_state,
             observation,
         )
-        self._primitive_selection_counts[int(primitive_id)] += 1
-        primitive_meta = self._primitive_metadata(int(primitive_id))
-        primitive_added_round = primitive_meta.get("added_round")
-        primitive_origin = self._primitive_origin(int(primitive_id))
-        if primitive_origin == "adaptive":
-            self._adaptive_primitive_selection_counts[int(primitive_id)] += 1
-            if primitive_added_round is not None:
-                self._adaptive_round_selection_counts[int(primitive_added_round)] += 1
 
         reference = self._reference_from_rollout(rollout_states, [primitive_id], observation)
         metadata = dict(reference.metadata)
         metadata["primitive_actions_shape"] = tuple(int(dim) for dim in primitive_actions.shape)
         metadata["primitive_id"] = int(primitive_id)
-        metadata["primitive_selected_count"] = int(self._primitive_selection_counts[int(primitive_id)])
-        metadata["primitive_selection_counts"] = self.get_primitive_selection_counts()
-        metadata["primitive_origin"] = primitive_origin
-        metadata["primitive_added_round"] = primitive_added_round if primitive_origin == "adaptive" else None
-        metadata["adaptive_library_size"] = int(len(self._adaptive_primitive_ids))
-        metadata["base_library_size"] = int(max(int(self.primitive_library.size) - len(self._adaptive_primitive_ids), 0))
-        metadata["adaptive_selected_count_total"] = int(sum(self._adaptive_primitive_selection_counts.values()))
-        metadata["adaptive_primitive_selection_counts"] = self.get_adaptive_primitive_selection_counts()
-        metadata["adaptive_round_selection_counts"] = self.get_adaptive_round_selection_counts()
         metadata["planning_mode"] = "closed_loop_policy"
         metadata["action_mask_used"] = bool(self.use_action_mask)
         metadata["action_mask_mode"] = self.action_mask_mode
         metadata["action_mask_update_every_k"] = int(self.action_mask_update_every_k)
-        metadata["action_mask_feasible_count"] = None if action_mask is None else int(np.count_nonzero(action_mask))
+        if action_mask is None:
+            feasible_count = None
+        elif self.action_mask_mode == "soft_ray":
+            feasible_count = self._last_action_mask_stats.get("soft_effective_action_count")
+        else:
+            feasible_count = int(np.count_nonzero(action_mask))
+        metadata["action_mask_feasible_count"] = feasible_count
         metadata["action_mask_precomputed_available"] = bool(
             self._last_action_mask_stats.get("precomputed_available", False)
         )
@@ -1100,10 +1936,33 @@ class PPOPrimitivePathPlanner:
         metadata["action_mask_precomputed_index_source"] = self._last_action_mask_stats.get(
             "precomputed_index_source"
         )
+        metadata["action_mask_ray_safety_available"] = bool(
+            self._last_action_mask_stats.get("ray_safety_available", False)
+        )
+        metadata["action_mask_ray_safety_used"] = bool(
+            self._last_action_mask_stats.get("ray_safety_used", False)
+        )
+        metadata["action_mask_soft_mask_ms"] = self._last_action_mask_stats.get("soft_mask_ms")
+        metadata["action_mask_soft_min"] = self._last_action_mask_stats.get("soft_mask_min")
+        metadata["action_mask_soft_max"] = self._last_action_mask_stats.get("soft_mask_max")
+        metadata["action_mask_soft_mean"] = self._last_action_mask_stats.get("soft_mask_mean")
+        metadata["action_mask_soft_terminal_reweight_applied"] = bool(
+            self._last_action_mask_stats.get("soft_terminal_reweight_applied", False)
+        )
+        metadata["action_mask_soft_fallback"] = self._last_action_mask_stats.get("soft_mask_fallback")
+        metadata["safety_stop_distance_m"] = float(self.safety_stop_distance_m)
+        metadata["safety_forward_sector_half_angle_rad"] = float(self.safety_forward_sector_half_angle)
+        metadata["safety_collision_buffer_m"] = float(self.safety_collision_buffer_m)
+        metadata["replan_on_emergency_stop"] = bool(self.replan_on_emergency_stop)
+        metadata.update(self._last_safety_stop_stats)
+        metadata.update(self._last_guard_stats)
+        metadata.update(selection_info)
         metadata["replan_every_steps"] = int(self.replan_every_steps)
         control_actions = self._expand_primitive_controls(primitive_actions)
+        control_prefix_steps = selection_info.get("control_prefix_steps")
+        if control_prefix_steps is not None:
+            control_actions = control_actions[: int(control_prefix_steps)]
         metadata["control_actions_shape"] = tuple(int(dim) for dim in control_actions.shape)
-        metadata["plan_runtime_ms"] = float((time.perf_counter() - plan_started_at) * 1000.0)
         return PPOPlanningResult(
             primitive_id=int(primitive_id),
             primitive_actions=primitive_actions,

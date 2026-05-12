@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import time
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -523,9 +524,11 @@ class SimulationRunner:
         self.fallback_controller = None
         self.last_status = None
         self.last_planning_step = -1
+        self.planning_history = []
         self.pending_primitive_controls = []
         self.pending_primitive_control_index = 0
-        self.planning_history = []
+        self._last_immediate_stop_replan_step = -1
+        self._last_control_exhaustion_replan_step = -1
 
         if scene.participant_kind == "wheel_loader":
             controller_cls = ArticulatedPurePursuitController or _FallbackArticulatedPurePursuitController
@@ -540,6 +543,12 @@ class SimulationRunner:
                     control_interval_ms=self.dt_ms,
                     replan_every_steps=wheel_loader_planner.get("replan_every_steps", 1),
                     deterministic=wheel_loader_planner.get("deterministic", True),
+                    safety_stop_distance_m=wheel_loader_planner.get("safety_stop_distance_m"),
+                    safety_forward_sector_half_angle_deg=wheel_loader_planner.get(
+                        "safety_forward_sector_half_angle_deg"
+                    ),
+                    safety_collision_buffer_m=wheel_loader_planner.get("safety_collision_buffer_m"),
+                    replan_on_emergency_stop=wheel_loader_planner.get("replan_on_emergency_stop"),
                 )
                 self.controller = None
                 self.active_reference_trajectory = None
@@ -558,7 +567,10 @@ class SimulationRunner:
             return
 
         try:
+            planning_started_at = time.perf_counter()
             planning_result = self.wheel_loader_planner.plan(self.scene, self.participant)
+            planning_runtime_ms = float((time.perf_counter() - planning_started_at) * 1000.0)
+            planning_result.metadata["plan_runtime_ms"] = planning_runtime_ms
         except Exception as exc:
             self.last_planning_error = str(exc)
             self.last_planning_result = None
@@ -586,7 +598,24 @@ class SimulationRunner:
                 "step": int(self.current_step),
                 "runtime_ms": float(planning_result.metadata.get("plan_runtime_ms", 0.0)),
                 "primitive_id": int(planning_result.primitive_id),
-                "control_actions": int(len(planning_result.control_actions)),
+                "action_mask_mode": planning_result.metadata.get("action_mask_mode"),
+                "action_mask_feasible_count": planning_result.metadata.get("action_mask_feasible_count"),
+                "action_mask_precomputed_used": planning_result.metadata.get("action_mask_precomputed_used"),
+                "action_mask_precomputed_candidate_count": planning_result.metadata.get(
+                    "action_mask_precomputed_candidate_count"
+                ),
+                "action_mask_ray_safety_used": planning_result.metadata.get("action_mask_ray_safety_used"),
+                "action_mask_soft_mask_ms": planning_result.metadata.get("action_mask_soft_mask_ms"),
+                "guard_attempts": planning_result.metadata.get("guard_attempts"),
+                "guard_emergency_used": planning_result.metadata.get("guard_emergency_used"),
+                "prefix_truncated": planning_result.metadata.get("prefix_truncated"),
+                "control_prefix_steps": planning_result.metadata.get("control_prefix_steps"),
+                "replan_when_controls_exhausted": planning_result.metadata.get(
+                    "replan_when_controls_exhausted"
+                ),
+                "parked_latch_active": planning_result.metadata.get("parked_latch_active"),
+                "stop_triggered": planning_result.metadata.get("stop_triggered"),
+                "stop_replan_requested": planning_result.metadata.get("stop_replan_requested"),
             }
         )
 
@@ -668,11 +697,21 @@ class SimulationRunner:
         self._maybe_replan_reference()
         if self.last_planning_result is None:
             return False
+        stop_replan_requested = bool(self.last_planning_result.metadata.get("stop_replan_requested", False))
 
         if self.pending_primitive_control_index >= len(self.pending_primitive_controls):
-            if self.pending_primitive_controls:
-                self.pending_primitive_control_index = len(self.pending_primitive_controls) - 1
-            else:
+            if (
+                self.wheel_loader_planner is not None
+                and self._last_control_exhaustion_replan_step != int(self.current_step)
+            ):
+                self._last_control_exhaustion_replan_step = int(self.current_step)
+                self._initialize_planned_reference()
+                if self.last_planning_result is None:
+                    return False
+                stop_replan_requested = bool(
+                    self.last_planning_result.metadata.get("stop_replan_requested", False)
+                )
+            if self.pending_primitive_control_index >= len(self.pending_primitive_controls):
                 return False
 
         current_state = self.participant.current_state
@@ -684,7 +723,15 @@ class SimulationRunner:
             interval=self.dt_ms,
         )
         self.pending_primitive_control_index += 1
-        self._commit_state(next_state)
+        if not self._commit_state(next_state):
+            return False
+        if (
+            stop_replan_requested
+            and self.wheel_loader_planner is not None
+            and self._last_immediate_stop_replan_step != int(self.current_step)
+        ):
+            self._last_immediate_stop_replan_step = int(self.current_step)
+            self._initialize_planned_reference()
         return True
 
     def _distance_to_goal(self) -> Optional[float]:
@@ -692,6 +739,57 @@ class SimulationRunner:
             return None
         state = self.participant.current_state
         return float(np.hypot(state.x - self.scene.goal_point[0], state.y - self.scene.goal_point[1]))
+
+    def _parking_completion_status(self, state=None) -> Tuple[bool, Dict[str, float]]:
+        candidate_state = self.participant.current_state if state is None else state
+        target_boxes = self.scene.map_.customs.get("target_boxes")
+        dest_state = self.scene.map_.customs.get("dest_state")
+        metrics = {
+            "geometry_available": False,
+            "front_overlap": 0.0,
+            "rear_overlap": 0.0,
+            "mean_overlap": 0.0,
+            "heading_error_deg": 0.0,
+            "speed_abs": abs(0.0 if getattr(candidate_state, "speed", None) is None else float(candidate_state.speed)),
+        }
+        if self.scene.participant_kind != "wheel_loader" or target_boxes is None or dest_state is None:
+            return False, metrics
+
+        current_boxes = self._candidate_geometries(candidate_state)
+        overlaps = []
+        for current_box, target_box in zip(current_boxes, target_boxes):
+            target_poly = target_box if isinstance(target_box, Polygon) else Polygon(target_box)
+            area_target = float(target_poly.area) + 1e-9
+            overlap_area = float(current_box.intersection(target_poly).area)
+            overlaps.append(float(overlap_area / area_target))
+
+        heading_error_deg = abs(
+            float(
+                np.degrees(
+                    np.arctan2(
+                        np.sin(float(candidate_state.heading) - float(dest_state.heading)),
+                        np.cos(float(candidate_state.heading) - float(dest_state.heading)),
+                    )
+                )
+            )
+        )
+        metrics.update(
+            {
+                "geometry_available": True,
+                "front_overlap": float(overlaps[0]) if overlaps else 0.0,
+                "rear_overlap": float(overlaps[1]) if len(overlaps) > 1 else (float(overlaps[0]) if overlaps else 0.0),
+                "mean_overlap": float(np.mean(overlaps)) if overlaps else 0.0,
+                "heading_error_deg": float(heading_error_deg),
+            }
+        )
+        is_complete = bool(
+            metrics["heading_error_deg"] <= 5.0
+            and metrics["front_overlap"] >= 0.80
+            and metrics["rear_overlap"] >= 0.45
+            and metrics["mean_overlap"] >= 0.75
+            and metrics["speed_abs"] <= 0.20
+        )
+        return is_complete, metrics
 
     def _handle_events(self) -> bool:
         if self.renderer is None or self.renderer.headless:
@@ -754,10 +852,15 @@ class SimulationRunner:
 
         self.current_step += 1
         distance_to_goal = self._distance_to_goal()
+        parking_complete, parking_metrics = self._parking_completion_status()
         if self.current_step >= self.max_steps:
             self.finished = True
             self.last_status = "max_steps"
-        elif distance_to_goal is not None and distance_to_goal < 2.0:
+        elif parking_complete:
+            self.finished = True
+            self.last_status = "parked"
+            self.scene.metadata["parking_completion_metrics"] = parking_metrics
+        elif not parking_metrics.get("geometry_available", False) and distance_to_goal is not None and distance_to_goal < 2.0:
             self.finished = True
             self.last_status = "goal_reached"
         return not self.finished
@@ -777,21 +880,6 @@ class SimulationRunner:
             )
             if self.last_planning_result is not None:
                 lines.append(f"primitive={self.last_planning_result.primitive_id}")
-                lines.append(
-                    f"plan_ms={self.last_planning_result.metadata.get('plan_runtime_ms', 0.0):.2f}"
-                )
-                lines.append(
-                    f"primitive_selected={self.last_planning_result.metadata.get('primitive_selected_count', 0)}"
-                )
-                primitive_origin = self.last_planning_result.metadata.get("primitive_origin", "unknown")
-                primitive_added_round = self.last_planning_result.metadata.get("primitive_added_round")
-                if primitive_origin == "adaptive" and primitive_added_round is not None:
-                    lines.append(f"primitive_origin=adaptive(round={primitive_added_round})")
-                else:
-                    lines.append(f"primitive_origin={primitive_origin}")
-                lines.append(
-                    f"adaptive_selected={self.last_planning_result.metadata.get('adaptive_selected_count_total', 0)}"
-                )
                 primitive_sequence = self.last_planning_result.metadata.get("primitive_sequence", [])
                 lines.append(f"planned_primitives={len(primitive_sequence)}")
             if self.last_planning_error:
